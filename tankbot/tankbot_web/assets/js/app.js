@@ -25,11 +25,13 @@ import {LiveSocket} from "phoenix_live_view"
 import {hooks as colocatedHooks} from "phoenix-colocated/tankbot_web"
 import topbar from "../vendor/topbar"
 import { Blockly as BlocklyHook, RunBlockly } from "./hooks/blockly_hook"
+import { DriveControls } from "./hooks/drive_hook"
 
 const Hooks = {
   ...colocatedHooks,
   Blockly: BlocklyHook,
   RunBlockly: RunBlockly,
+  DriveControls: DriveControls,
 }
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")

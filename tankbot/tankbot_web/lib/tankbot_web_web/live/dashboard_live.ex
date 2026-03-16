@@ -124,19 +124,30 @@ defmodule TankbotWebWeb.DashboardLive do
             <div class="grid grid-cols-3 gap-2 max-w-xs mx-auto" id="drive-controls" phx-hook="DriveControls">
               <div></div>
               <button phx-click="motor" phx-value-left="2000" phx-value-right="2000"
-                      class="bg-blue-600 hover:bg-blue-500 rounded p-3 text-center font-bold">▲</button>
+                      class="bg-blue-600 hover:bg-blue-500 rounded p-3 text-center font-bold">
+                <span class="block">▲</span><span class="text-xs opacity-60">W</span>
+              </button>
               <div></div>
               <button phx-click="motor" phx-value-left="-1500" phx-value-right="1500"
-                      class="bg-blue-600 hover:bg-blue-500 rounded p-3 text-center font-bold">◄</button>
+                      class="bg-blue-600 hover:bg-blue-500 rounded p-3 text-center font-bold">
+                <span class="block">◄</span><span class="text-xs opacity-60">A</span>
+              </button>
               <button phx-click="stop"
-                      class="bg-red-600 hover:bg-red-500 rounded p-3 text-center font-bold">■</button>
+                      class="bg-red-600 hover:bg-red-500 rounded p-3 text-center font-bold">
+                <span class="block">■</span><span class="text-xs opacity-60">Stop</span>
+              </button>
               <button phx-click="motor" phx-value-left="1500" phx-value-right="-1500"
-                      class="bg-blue-600 hover:bg-blue-500 rounded p-3 text-center font-bold">►</button>
+                      class="bg-blue-600 hover:bg-blue-500 rounded p-3 text-center font-bold">
+                <span class="block">►</span><span class="text-xs opacity-60">D</span>
+              </button>
               <div></div>
               <button phx-click="motor" phx-value-left="-2000" phx-value-right="-2000"
-                      class="bg-blue-600 hover:bg-blue-500 rounded p-3 text-center font-bold">▼</button>
+                      class="bg-blue-600 hover:bg-blue-500 rounded p-3 text-center font-bold">
+                <span class="block">▼</span><span class="text-xs opacity-60">S</span>
+              </button>
               <div></div>
             </div>
+            <p class="text-center text-gray-500 text-xs mt-2">WASD or arrow keys to drive</p>
           </div>
 
           <%!-- Mode selector --%>

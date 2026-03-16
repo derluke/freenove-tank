@@ -111,17 +111,17 @@ class Robot:
     async def _handle_ws_cmd(self, msg: dict) -> None:
         cmd_type = msg.get("cmd")
         if cmd_type == "motor":
-            left, right = msg.get("left", 0), msg.get("right", 0)
+            left, right = int(msg.get("left", 0)), int(msg.get("right", 0))
             self.left_speed, self.right_speed = left, right
             self.motor.set(left, right)
         elif cmd_type == "servo":
-            self.servo.set_angle(msg.get("channel", 0), msg.get("angle", 90))
+            self.servo.set_angle(int(msg.get("channel", 0)), int(msg.get("angle", 90)))
         elif cmd_type == "led":
-            self.led.set_by_mask(msg.get("mask", 0xF), msg.get("r", 0), msg.get("g", 0), msg.get("b", 0))
+            self.led.set_by_mask(int(msg.get("mask", 0xF)), int(msg.get("r", 0)), int(msg.get("g", 0)), int(msg.get("b", 0)))
         elif cmd_type == "led_off":
             self.led.off()
         elif cmd_type == "mode":
-            self._handle_mode_switch(msg.get("mode", 0))
+            self._handle_mode_switch(int(msg.get("mode", 0)))
         elif cmd_type == "stop":
             self.motor.stop()
 
@@ -138,6 +138,8 @@ class Robot:
                     continue
 
                 frame = await self.camera.get_frame()
+                if frame is None:
+                    continue
                 tasks = []
                 if self.legacy_video.has_clients:
                     tasks.append(self.legacy_video.send_frame(frame))
@@ -242,8 +244,12 @@ class Robot:
         await asyncio.gather(*tasks, return_exceptions=True)
         await self.shutdown()
 
+        # Force exit — camera thread can block asyncio from exiting
+        import os
+        os._exit(0)
+
     async def shutdown(self) -> None:
-        self.motor.stop()
+        self.motor.stop_immediate()
         self.led.off()
         await self.legacy_cmd.stop()
         await self.legacy_video.stop()

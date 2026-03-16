@@ -4,6 +4,9 @@ Provides:
   - JSON command/telemetry on text frames
   - Binary JPEG video frames
   - Event subscription model
+
+Each client gets a dedicated send queue so that broadcasting telemetry/video
+never blocks the receive loop (websockets requires serialised writes).
 """
 
 from __future__ import annotations
@@ -11,11 +14,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Callable, Awaitable
+from dataclasses import dataclass, field
+from typing import Callable, Awaitable, Any
 
 log = logging.getLogger(__name__)
 
 WS_PORT = 9000
+
+
+@dataclass
+class _Client:
+    ws: Any
+    addr: str
+    send_queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=60))
+    wants_video: bool = False
 
 
 class WebSocketAPI:
@@ -23,20 +35,28 @@ class WebSocketAPI:
 
     def __init__(self, on_command: Callable[[dict], Awaitable[None] | None]) -> None:
         self._on_command = on_command
-        self._clients: set = set()
-        self._video_clients: set = set()
+        self._clients: dict[Any, _Client] = {}  # ws → _Client
         self._server = None
 
     async def start(self, host: str, port: int = WS_PORT) -> None:
         import websockets
 
-        self._server = await websockets.serve(self._handle_client, host, port)
+        self._server = await websockets.serve(
+            self._handle_client, host, port,
+            ping_interval=None,
+            max_size=2**22,
+        )
         log.info("WebSocket API listening on ws://%s:%d", host, port)
 
     async def _handle_client(self, websocket) -> None:
-        self._clients.add(websocket)
         addr = websocket.remote_address
-        log.info("WS client connected: %s", addr)
+        addr_str = f"{addr}" if addr else "unknown"
+        client = _Client(ws=websocket, addr=addr_str)
+        self._clients[websocket] = client
+        log.info("WS client connected: %s", addr_str)
+
+        # Spawn a dedicated sender task for this client
+        sender_task = asyncio.create_task(self._sender(client))
 
         try:
             async for raw in websocket:
@@ -45,46 +65,52 @@ class WebSocketAPI:
                         msg = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
-                    # Handle subscription
                     if msg.get("type") == "subscribe" and "video" in msg.get("channels", []):
-                        self._video_clients.add(websocket)
+                        client.wants_video = True
+                        log.info("WS client %s subscribed to video", addr_str)
                         continue
-                    result = self._on_command(msg)
-                    if asyncio.iscoroutine(result):
-                        await result
+                    try:
+                        result = self._on_command(msg)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as cmd_err:
+                        log.warning("Command handler error: %s (msg=%s)", cmd_err, msg)
+        except Exception as e:
+            log.warning("WS client error (%s): %s", addr_str, e)
+        finally:
+            sender_task.cancel()
+            self._clients.pop(websocket, None)
+            log.info("WS client disconnected: %s", addr_str)
+
+    async def _sender(self, client: _Client) -> None:
+        """Dedicated send loop — drains the queue and writes to the websocket."""
+        try:
+            while True:
+                data = await client.send_queue.get()
+                await client.ws.send(data)
+        except asyncio.CancelledError:
+            pass
         except Exception:
             pass
-        finally:
-            self._clients.discard(websocket)
-            self._video_clients.discard(websocket)
-            log.info("WS client disconnected: %s", addr)
+
+    def _enqueue(self, client: _Client, data: str | bytes) -> None:
+        """Non-blocking enqueue — drops if the queue is full (backpressure)."""
+        try:
+            client.send_queue.put_nowait(data)
+        except asyncio.QueueFull:
+            pass  # Drop frame/telemetry rather than block
 
     async def broadcast_telemetry(self, data: dict) -> None:
         if not self._clients:
             return
         payload = json.dumps(data)
-        dead = []
-        for ws in list(self._clients):
-            try:
-                await ws.send(payload)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self._clients.discard(ws)
-            self._video_clients.discard(ws)
+        for client in list(self._clients.values()):
+            self._enqueue(client, payload)
 
     async def broadcast_frame(self, jpeg_data: bytes) -> None:
-        if not self._video_clients:
-            return
-        dead = []
-        for ws in list(self._video_clients):
-            try:
-                await ws.send(jpeg_data)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self._video_clients.discard(ws)
-            self._clients.discard(ws)
+        for client in list(self._clients.values()):
+            if client.wants_video:
+                self._enqueue(client, jpeg_data)
 
     @property
     def has_clients(self) -> bool:
@@ -92,7 +118,7 @@ class WebSocketAPI:
 
     @property
     def has_video_clients(self) -> bool:
-        return len(self._video_clients) > 0
+        return any(c.wants_video for c in self._clients.values())
 
     async def stop(self) -> None:
         if self._server:

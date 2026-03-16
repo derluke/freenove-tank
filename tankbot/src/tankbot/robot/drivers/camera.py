@@ -66,13 +66,14 @@ class Camera:
         self._cam.stop_recording()
         self._streaming = False
 
-    def get_frame_sync(self) -> bytes:
-        """Blocking call — returns the next JPEG frame."""
+    def get_frame_sync(self, timeout: float = 1.0) -> bytes | None:
+        """Blocking call — returns the next JPEG frame, or None on timeout."""
         with self._buffer.condition:
-            self._buffer.condition.wait()
+            if not self._buffer.condition.wait(timeout=timeout):
+                return None
             return self._buffer.frame
 
-    async def get_frame(self) -> bytes:
+    async def get_frame(self) -> bytes | None:
         """Async wrapper around the blocking frame wait."""
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self.get_frame_sync)
