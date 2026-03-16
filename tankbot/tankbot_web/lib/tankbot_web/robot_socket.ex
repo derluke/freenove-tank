@@ -25,6 +25,8 @@ defmodule TankbotWeb.RobotSocket do
   def led_off(), do: send_command(%{cmd: "led_off"})
   def stop(), do: send_command(%{cmd: "stop"})
   def set_mode(mode), do: send_command(%{cmd: "mode", mode: mode})
+  def arm(dir), do: send_command(%{cmd: "arm", dir: dir})
+  def grabber(dir), do: send_command(%{cmd: "grabber", dir: dir})
 
   # --- GenServer callbacks ---
 

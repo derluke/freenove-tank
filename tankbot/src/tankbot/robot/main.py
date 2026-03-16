@@ -42,7 +42,7 @@ class Robot:
         self.ultrasonic = Ultrasonic(pi_version=self.cfg.pi_version)
         self.infrared = InfraredSensors(self.cfg.pcb_version)
         self.led = LedStrip(self.cfg.pcb_version, self.cfg.pi_version)
-        self.camera = Camera(stream_size=self.cfg.stream_size)
+        self.camera = Camera(stream_size=self.cfg.stream_size, hflip=True, vflip=True)
 
         # State
         self.car_mode = CarMode.MANUAL
@@ -124,6 +124,28 @@ class Robot:
             self._handle_mode_switch(int(msg.get("mode", 0)))
         elif cmd_type == "stop":
             self.motor.stop()
+        elif cmd_type == "arm":
+            # Ch1 = arm (90° down, 150° up)
+            direction = msg.get("dir")
+            step = int(msg.get("step", 5))
+            if direction == "up":
+                new = self.servo.get_target(1) + step
+            elif direction == "down":
+                new = self.servo.get_target(1) - step
+            else:
+                new = int(msg.get("angle", self.servo.get_target(1)))
+            self.servo.set_angle(1, new)
+        elif cmd_type == "grabber":
+            # Ch0 = grabber (90° open, 150° closed)
+            direction = msg.get("dir")
+            step = int(msg.get("step", 5))
+            if direction == "open":
+                new = self.servo.get_target(0) - step
+            elif direction == "close":
+                new = self.servo.get_target(0) + step
+            else:
+                new = int(msg.get("angle", self.servo.get_target(0)))
+            self.servo.set_angle(0, new)
 
     # ------------------------------------------------------------------
     # Background tasks

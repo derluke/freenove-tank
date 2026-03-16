@@ -94,15 +94,15 @@ MOTOR_DUTY_MAX = 4095
 
 # Servo angle limits per channel
 SERVO_LIMITS: dict[int, tuple[int, int]] = {
-    0: (90, 150),
-    1: (90, 150),
+    0: (90, 140),
+    1: (75, 150),
     2: (0, 180),
 }
 
 # Default servo positions
 SERVO_DEFAULTS: dict[int, int] = {
-    0: 90,
-    1: 140,
+    0: 130,   # grabber slightly open
+    1: 140,   # arm up
 }
 
 

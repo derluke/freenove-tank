@@ -68,6 +68,16 @@ defmodule TankbotWebWeb.DashboardLive do
     {:noreply, socket}
   end
 
+  def handle_event("arm", %{"dir" => dir}, socket) do
+    TankbotWeb.RobotSocket.arm(dir)
+    {:noreply, socket}
+  end
+
+  def handle_event("grabber", %{"dir" => dir}, socket) do
+    TankbotWeb.RobotSocket.grabber(dir)
+    {:noreply, socket}
+  end
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -121,33 +131,59 @@ defmodule TankbotWebWeb.DashboardLive do
           <%!-- Controls --%>
           <div class="bg-gray-800 rounded-lg p-4">
             <h2 class="text-xl font-semibold mb-3">Drive</h2>
-            <div class="grid grid-cols-3 gap-2 max-w-xs mx-auto" id="drive-controls" phx-hook="DriveControls">
+            <div class="grid grid-cols-3 gap-2 max-w-xs mx-auto select-none" id="drive-controls" phx-hook="DriveControls">
               <div></div>
               <button phx-click="motor" phx-value-left="2000" phx-value-right="2000"
-                      class="bg-blue-600 hover:bg-blue-500 rounded p-3 text-center font-bold">
+                      data-hold-event="motor" class="bg-blue-600 hover:bg-blue-500 active:bg-blue-400 rounded p-3 text-center font-bold">
                 <span class="block">▲</span><span class="text-xs opacity-60">W</span>
               </button>
               <div></div>
               <button phx-click="motor" phx-value-left="-1500" phx-value-right="1500"
-                      class="bg-blue-600 hover:bg-blue-500 rounded p-3 text-center font-bold">
+                      data-hold-event="motor" class="bg-blue-600 hover:bg-blue-500 active:bg-blue-400 rounded p-3 text-center font-bold">
                 <span class="block">◄</span><span class="text-xs opacity-60">A</span>
               </button>
               <button phx-click="stop"
-                      class="bg-red-600 hover:bg-red-500 rounded p-3 text-center font-bold">
-                <span class="block">■</span><span class="text-xs opacity-60">Stop</span>
+                      class="bg-red-600 hover:bg-red-500 active:bg-red-400 rounded p-3 text-center font-bold">
+                <span class="block">■</span><span class="text-xs opacity-60">Space</span>
               </button>
               <button phx-click="motor" phx-value-left="1500" phx-value-right="-1500"
-                      class="bg-blue-600 hover:bg-blue-500 rounded p-3 text-center font-bold">
+                      data-hold-event="motor" class="bg-blue-600 hover:bg-blue-500 active:bg-blue-400 rounded p-3 text-center font-bold">
                 <span class="block">►</span><span class="text-xs opacity-60">D</span>
               </button>
               <div></div>
               <button phx-click="motor" phx-value-left="-2000" phx-value-right="-2000"
-                      class="bg-blue-600 hover:bg-blue-500 rounded p-3 text-center font-bold">
+                      data-hold-event="motor" class="bg-blue-600 hover:bg-blue-500 active:bg-blue-400 rounded p-3 text-center font-bold">
                 <span class="block">▼</span><span class="text-xs opacity-60">S</span>
               </button>
               <div></div>
+
+              <%!-- Arm & Grabber inline --%>
+              <div class="col-span-3 grid grid-cols-4 gap-2 mt-3 pt-3 border-t border-gray-700">
+                <button phx-click="arm" phx-value-dir="up"
+                        data-hold-event="arm" data-hold-dir="up"
+                        class="bg-teal-600 hover:bg-teal-500 active:bg-teal-400 rounded p-3 font-bold text-center">
+                  <span class="block">▲</span><span class="text-xs opacity-60">R</span>
+                </button>
+                <button phx-click="arm" phx-value-dir="down"
+                        data-hold-event="arm" data-hold-dir="down"
+                        class="bg-teal-600 hover:bg-teal-500 active:bg-teal-400 rounded p-3 font-bold text-center">
+                  <span class="block">▼</span><span class="text-xs opacity-60">F</span>
+                </button>
+                <button phx-click="grabber" phx-value-dir="close"
+                        data-hold-event="grabber" data-hold-dir="close"
+                        class="bg-amber-600 hover:bg-amber-500 active:bg-amber-400 rounded p-3 font-bold text-center">
+                  <span class="block">⊏⊐</span><span class="text-xs opacity-60">T</span>
+                </button>
+                <button phx-click="grabber" phx-value-dir="open"
+                        data-hold-event="grabber" data-hold-dir="open"
+                        class="bg-amber-600 hover:bg-amber-500 active:bg-amber-400 rounded p-3 font-bold text-center">
+                  <span class="block">⊐⊏</span><span class="text-xs opacity-60">G</span>
+                </button>
+              </div>
+              <p class="col-span-3 text-center text-gray-500 text-xs mt-1">
+                Drive: WASD · Arm: R/F · Grab: T/G · Stop: Space
+              </p>
             </div>
-            <p class="text-center text-gray-500 text-xs mt-2">WASD or arrow keys to drive</p>
           </div>
 
           <%!-- Mode selector --%>
