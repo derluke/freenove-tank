@@ -33,13 +33,14 @@ tasks:
         --exclude '.ruff_cache'
         "{{.LOCAL_DIR}}/src"
         "{{.LOCAL_DIR}}/pyproject.toml"
+        "{{.LOCAL_DIR}}/uv.lock"
         {{.PI_USER}}@{{.PI_HOST}}:{{.PI_DIR}}/
 
   pi:install:
     desc: Install Python dependencies on the Pi
     deps: [pi:sync]
     cmds:
-      - ssh {{.PI_USER}}@{{.PI_HOST}} "cd {{.PI_DIR}} && ~/.local/bin/uv sync --extra robot"
+      - ssh {{.PI_USER}}@{{.PI_HOST}} "cd {{.PI_DIR}} && ~/.local/bin/uv pip install -e '.[robot]'"
       # Symlink system-only Pi packages into the venv
       - >-
         ssh {{.PI_USER}}@{{.PI_HOST}} "
@@ -119,6 +120,11 @@ tasks:
     desc: Start the autonomous vision engine
     cmds:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000
+
+  vision:debug:
+    desc: Vision debug mode — YOLO + depth overlays, manual driving
+    cmds:
+      - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug
 
   # ---------------------------------------------------------------------------
   # Development — lint, typecheck, format

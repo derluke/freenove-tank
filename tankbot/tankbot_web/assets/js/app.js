@@ -26,12 +26,14 @@ import {hooks as colocatedHooks} from "phoenix-colocated/tankbot_web"
 import topbar from "../vendor/topbar"
 import { Blockly as BlocklyHook, RunBlockly } from "./hooks/blockly_hook"
 import { DriveControls } from "./hooks/drive_hook"
+import { ExplorationMap } from "./hooks/map_hook"
 
 const Hooks = {
   ...colocatedHooks,
   Blockly: BlocklyHook,
   RunBlockly: RunBlockly,
   DriveControls: DriveControls,
+  ExplorationMap: ExplorationMap,
 }
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")

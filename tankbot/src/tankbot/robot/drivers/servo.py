@@ -22,6 +22,7 @@ _PINS = {0: 7, 1: 8, 2: 25}
 # Sweep config
 _SWEEP_INTERVAL = 0.02  # 50 Hz — one step every 20ms
 _SWEEP_STEP = 3         # degrees per tick (~150°/sec)
+_DETACH_DELAY = 0.5     # seconds after reaching target before cutting PWM
 
 
 class _GpiozeroBackend:
@@ -45,6 +46,11 @@ class _GpiozeroBackend:
     def set_angle(self, channel: int, angle: int) -> None:
         if channel in self._servos:
             self._servos[channel].angle = angle
+
+    def detach(self, channel: int) -> None:
+        """Stop sending PWM so servo draws no current."""
+        if channel in self._servos:
+            self._servos[channel].angle = None  # type: ignore[assignment]
 
     def stop(self) -> None:
         pass
@@ -80,6 +86,13 @@ class _HardwarePWMBackend:
         elif channel == 2:
             self._servo2.angle = angle
 
+    def detach(self, channel: int) -> None:
+        """Stop sending PWM so servo draws no current."""
+        if channel in self._pwms:
+            self._pwms[channel].change_duty_cycle(0)
+        elif channel == 2:
+            self._servo2.angle = None  # type: ignore[assignment]
+
     def stop(self) -> None:
         for pwm in self._pwms.values():
             pwm.stop()
@@ -98,7 +111,9 @@ class ServoController:
 
         self._angles: dict[int, int] = {}
         self._targets: dict[int, int] = {}
+        self._detached: set[int] = set()
         self._sweep_task: asyncio.Task | None = None  # type: ignore[type-arg]
+        self._detach_task: asyncio.Task | None = None  # type: ignore[type-arg]
 
         # Move to default positions (immediate — no sweep on startup)
         for ch, angle in SERVO_DEFAULTS.items():
@@ -132,6 +147,9 @@ class ServoController:
         pass
 
     def _ensure_sweep_running(self) -> None:
+        # Cancel any pending detach — servo is active again
+        if self._detach_task is not None and not self._detach_task.done():
+            self._detach_task.cancel()
         if self._sweep_task is None or self._sweep_task.done():
             try:
                 loop = asyncio.get_running_loop()
@@ -143,7 +161,7 @@ class ServoController:
                     self._backend.set_angle(ch, target)
 
     async def _sweep_loop(self) -> None:
-        """Smoothly step each servo 1° per tick toward its target."""
+        """Smoothly step each servo toward its target."""
         try:
             while True:
                 all_done = True
@@ -152,6 +170,7 @@ class ServoController:
                     target = self._targets[ch]
                     if current != target:
                         all_done = False
+                        self._detached.discard(ch)
                         if current < target:
                             current = min(current + _SWEEP_STEP, target)
                         else:
@@ -161,5 +180,20 @@ class ServoController:
                 if all_done:
                     break
                 await asyncio.sleep(_SWEEP_INTERVAL)
+            # Schedule deferred detach to save power
+            loop = asyncio.get_running_loop()
+            self._detach_task = loop.create_task(self._deferred_detach())
+        except asyncio.CancelledError:
+            pass
+
+    async def _deferred_detach(self) -> None:
+        """Wait, then cut PWM on idle servos to save power."""
+        try:
+            await asyncio.sleep(_DETACH_DELAY)
+            for ch in list(self._targets):
+                if self._angles.get(ch) == self._targets.get(ch) and ch not in self._detached:
+                    self._backend.detach(ch)
+                    self._detached.add(ch)
+                    log.debug("Detached servo %d to save power", ch)
         except asyncio.CancelledError:
             pass

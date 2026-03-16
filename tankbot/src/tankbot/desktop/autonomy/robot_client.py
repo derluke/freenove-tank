@@ -77,6 +77,27 @@ class RobotClient:
     async def send_mode(self, mode: int) -> None:
         await self._send({"cmd": "mode", "mode": mode})
 
+    async def send_vision_status(
+        self,
+        state: str,
+        detections: list[dict],
+        distance: float,
+        depth_strips: tuple[float, float, float] | None = None,
+        map_data: dict | None = None,
+    ) -> None:
+        """Push vision engine state to the robot for dashboard display."""
+        msg: dict = {
+            "cmd": "vision",
+            "state": state,
+            "detections": detections,
+            "distance": distance,
+        }
+        if depth_strips is not None:
+            msg["depth"] = {"left": depth_strips[0], "center": depth_strips[1], "right": depth_strips[2]}
+        if map_data is not None:
+            msg["map"] = map_data
+        await self._send(msg)
+
     async def _send(self, data: dict) -> None:
         if self._ws:
             await self._ws.send(json.dumps(data))

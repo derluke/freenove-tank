@@ -48,6 +48,7 @@ class Robot:
         self.car_mode = CarMode.MANUAL
         self.left_speed = 0
         self.right_speed = 0
+        self.vision_status: dict | None = None  # latest from vision engine
 
         # Servers
         self.legacy_cmd = LegacyCmdServer(on_message=self._handle_legacy_cmd)
@@ -124,6 +125,20 @@ class Robot:
             self._handle_mode_switch(int(msg.get("mode", 0)))
         elif cmd_type == "stop":
             self.motor.stop()
+        elif cmd_type == "vision":
+            # Store and re-broadcast vision engine status to all clients
+            self.vision_status = {
+                "type": "vision",
+                "state": msg.get("state", "unknown"),
+                "detections": msg.get("detections", []),
+                "distance": msg.get("distance", 0),
+            }
+            if "depth" in msg:
+                self.vision_status["depth"] = msg["depth"]
+            if "map" in msg:
+                self.vision_status["map"] = msg["map"]
+            if self.ws_api.has_clients:
+                await self.ws_api.broadcast_telemetry(self.vision_status)
         elif cmd_type == "arm":
             # Ch1 = arm (90° down, 150° up)
             direction = msg.get("dir")

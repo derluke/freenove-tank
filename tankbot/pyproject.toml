@@ -19,10 +19,12 @@ robot = [
 # Install on the desktop
 desktop = [
     "websockets>=13.0",
-    "ultralytics>=8.3",      # YOLOv8/v11
+    "ultralytics>=8.3",      # YOLO26
     "opencv-python>=4.10",
     "torch>=2.4",
     "numpy>=1.26",
+    "transformers>=4.48",    # Depth Pro (apple/DepthPro-hf)
+    "Pillow",
 ]
 
 [project.scripts]
@@ -83,5 +85,7 @@ module = [
     "spi_ledpixel.*",
     "ultralytics.*",
     "cv2.*",
+    "transformers.*",
+    "PIL.*",
 ]
 ignore_missing_imports = true

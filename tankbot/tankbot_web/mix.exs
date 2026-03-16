@@ -72,7 +72,11 @@ defmodule TankbotWeb.MixProject do
   defp aliases do
     [
       setup: ["deps.get", "assets.setup", "assets.build"],
-      "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
+      "assets.setup": [
+        "tailwind.install --if-missing",
+        "esbuild.install --if-missing",
+        "cmd npm install --prefix assets"
+      ],
       "assets.build": ["compile", "tailwind tankbot_web", "esbuild tankbot_web"],
       "assets.deploy": [
         "tailwind tankbot_web --minify",
