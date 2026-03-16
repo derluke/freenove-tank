@@ -1,0 +1,174 @@
+version: "3"
+
+vars:
+  PI_HOST: 192.168.178.45
+  PI_USER: lukas
+  PI_DIR: /home/lukas/tankbot
+  LOCAL_DIR: '{{.ROOT_DIR}}'
+
+tasks:
+  # ---------------------------------------------------------------------------
+  # Pi deployment
+  # ---------------------------------------------------------------------------
+  pi:install-uv:
+    desc: Install uv on the Raspberry Pi
+    cmds:
+      - ssh {{.PI_USER}}@{{.PI_HOST}} "curl -LsSf https://astral.sh/uv/install.sh | sh"
+
+  pi:sync:
+    desc: Rsync the tankbot code to the Pi
+    cmds:
+      - ssh {{.PI_USER}}@{{.PI_HOST}} "mkdir -p {{.PI_DIR}}"
+      - >-
+        rsync -avz --delete
+        --exclude '__pycache__'
+        --exclude '.venv'
+        --exclude 'node_modules'
+        --exclude '_build'
+        --exclude 'deps'
+        --exclude 'tankbot_web'
+        --exclude '.mypy_cache'
+        --exclude '.ruff_cache'
+        "{{.LOCAL_DIR}}/src"
+        "{{.LOCAL_DIR}}/pyproject.toml"
+        {{.PI_USER}}@{{.PI_HOST}}:{{.PI_DIR}}/
+
+  pi:install:
+    desc: Install Python dependencies on the Pi
+    deps: [pi:sync]
+    cmds:
+      - ssh {{.PI_USER}}@{{.PI_HOST}} "cd {{.PI_DIR}} && ~/.local/bin/uv sync --extra robot"
+      # Symlink system-only Pi packages into the venv
+      - >-
+        ssh {{.PI_USER}}@{{.PI_HOST}} "
+        VENV={{.PI_DIR}}/.venv/lib/python3.11/site-packages;
+        ln -sf /usr/lib/python3/dist-packages/libcamera \$VENV/libcamera 2>/dev/null;
+        ln -sf /usr/lib/python3/dist-packages/pykms \$VENV/pykms 2>/dev/null;
+        echo 'System packages symlinked'
+        "
+
+  pi:deploy:
+    desc: Full deploy — sync code + install deps on Pi
+    cmds:
+      - task: pi:sync
+      - task: pi:install
+
+  pi:start:
+    desc: Start the robot server on the Pi
+    cmds:
+      - ssh -t {{.PI_USER}}@{{.PI_HOST}} "cd {{.PI_DIR}} && ~/.local/bin/uv run tankbot-robot"
+
+  pi:stop:
+    desc: Stop the robot server on the Pi
+    cmds:
+      - ssh {{.PI_USER}}@{{.PI_HOST}} "pkill -f 'tankbot-robot' || true"
+
+  pi:restart:
+    desc: Stop, deploy, and restart the robot server
+    cmds:
+      - task: pi:stop
+      - task: pi:deploy
+      - task: pi:start
+
+  pi:logs:
+    desc: Tail robot logs on the Pi
+    cmds:
+      - ssh -t {{.PI_USER}}@{{.PI_HOST}} "journalctl --user -u tankbot -f 2>/dev/null || echo 'No systemd service, use pi:start instead'"
+
+  pi:ssh:
+    desc: Open an SSH session to the Pi
+    interactive: true
+    cmds:
+      - ssh {{.PI_USER}}@{{.PI_HOST}}
+
+  # ---------------------------------------------------------------------------
+  # Desktop — Phoenix web app
+  # ---------------------------------------------------------------------------
+  web:setup:
+    desc: Install Phoenix dependencies and build assets
+    dir: tankbot_web
+    cmds:
+      - mix deps.get
+      - mix assets.setup
+      - mix assets.build
+
+  web:start:
+    desc: Start the Phoenix dev server
+    dir: tankbot_web
+    cmds:
+      - mix phx.server
+
+  web:iex:
+    desc: Start Phoenix in interactive Elixir shell
+    dir: tankbot_web
+    interactive: true
+    cmds:
+      - iex -S mix phx.server
+
+  # ---------------------------------------------------------------------------
+  # Desktop — Autonomy / Vision
+  # ---------------------------------------------------------------------------
+  vision:setup:
+    desc: Install Python desktop dependencies (YOLO, torch, etc.)
+    cmds:
+      - uv sync --extra desktop
+
+  vision:start:
+    desc: Start the autonomous vision engine
+    cmds:
+      - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000
+
+  # ---------------------------------------------------------------------------
+  # Development — lint, typecheck, format
+  # ---------------------------------------------------------------------------
+  lint:
+    desc: Run ruff linter
+    cmds:
+      - uv run ruff check {{.LOCAL_DIR}}/src
+
+  lint:fix:
+    desc: Run ruff linter with auto-fix
+    cmds:
+      - uv run ruff check --fix {{.LOCAL_DIR}}/src
+
+  format:
+    desc: Run ruff formatter
+    cmds:
+      - uv run ruff format {{.LOCAL_DIR}}/src
+
+  typecheck:
+    desc: Run mypy type checker
+    cmds:
+      - uv run mypy {{.LOCAL_DIR}}/src/tankbot
+
+  check:
+    desc: Run all checks (lint + typecheck + format check)
+    cmds:
+      - task: lint
+      - task: typecheck
+      - uv run ruff format --check {{.LOCAL_DIR}}/src
+
+  # ---------------------------------------------------------------------------
+  # Compound workflows
+  # ---------------------------------------------------------------------------
+  up:
+    desc: Deploy to Pi and start everything (robot + web + vision)
+    cmds:
+      - task: pi:deploy
+      - task: pi:start
+    # Run web and vision separately in other terminals:
+    # task web:start
+    # task vision:start
+
+  dev:
+    desc: Quick iteration — sync to Pi and restart robot
+    cmds:
+      - task: pi:restart
+
+  setup:
+    desc: First-time setup — install everything everywhere
+    cmds:
+      - task: pi:install-uv
+      - task: pi:deploy
+      - task: web:setup
+      - task: vision:setup
