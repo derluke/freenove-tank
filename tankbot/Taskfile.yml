@@ -3,10 +3,9 @@ version: "3"
 dotenv: [".env"]
 
 vars:
-  # Override these with environment variables or a .env file
-  PI_HOST: '{{env "PI_HOST" | default "raspberrypi.local"}}'
-  PI_USER: '{{env "PI_USER" | default "pi"}}'
-  PI_DIR: '{{env "PI_DIR" | default "/home/pi/tankbot"}}'
+  PI_HOST: '{{.PI_HOST | default "raspberrypi.local"}}'
+  PI_USER: '{{.PI_USER | default "pi"}}'
+  PI_DIR: '{{.PI_DIR | default "/home/pi/tankbot"}}'
   LOCAL_DIR: '{{.ROOT_DIR}}'
 
 tasks:
