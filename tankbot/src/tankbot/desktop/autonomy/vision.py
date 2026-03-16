@@ -27,7 +27,9 @@ TURN_SPEED = 2000
 
 
 class VisionEngine:
-    def __init__(self, robot_url: str = "ws://192.168.178.45:9000", model: str = "yolo11n.pt") -> None:
+    def __init__(self, robot_url: str = "", model: str = "yolo11n.pt") -> None:
+        import os
+        robot_url = robot_url or os.environ.get("ROBOT_URL", "ws://localhost:9000")
         self._client = RobotClient(robot_url)
         self._model_path = model
         self._model = None
@@ -149,7 +151,7 @@ def main() -> None:
     )
 
     parser = argparse.ArgumentParser(description="Tank robot autonomous vision")
-    parser.add_argument("--robot", default="ws://192.168.178.45:9000", help="Robot WebSocket URL")
+    parser.add_argument("--robot", default="", help="Robot WebSocket URL (or set ROBOT_URL env var)")
     parser.add_argument("--model", default="yolo11n.pt", help="YOLO model path")
     args = parser.parse_args()
 

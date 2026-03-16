@@ -16,7 +16,9 @@ log = logging.getLogger(__name__)
 
 
 class RobotClient:
-    def __init__(self, robot_url: str = "ws://192.168.178.45:9000") -> None:
+    def __init__(self, robot_url: str = "") -> None:
+        import os
+        robot_url = robot_url or os.environ.get("ROBOT_URL", "ws://localhost:9000")
         self._url = robot_url
         self._ws: Any = None
         self._on_telemetry: Callable[[dict], Awaitable[None] | None] | None = None

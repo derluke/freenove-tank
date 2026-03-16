@@ -1,0 +1,19 @@
+# Environment (contains PII like IP addresses)
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.mypy_cache/
+.ruff_cache/
+
+# Elixir / Phoenix
+_build/
+deps/
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp

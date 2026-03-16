@@ -18,10 +18,24 @@ Replaces the original PyQt5 desktop app with a three-part architecture:
 - Desktop machine on the same network
 - [Task](https://taskfile.dev) runner, [uv](https://docs.astral.sh/uv/) (Python), [Elixir](https://elixir-lang.org/install.html) + [Node.js](https://nodejs.org/)
 
-### First-time setup
+### Configuration
 
 ```bash
 cd tankbot
+cp .env.example .env
+# Edit .env with your Pi's IP, username, and deploy path
+```
+
+| Variable | Default | Used by |
+|----------|---------|---------|
+| `PI_HOST` | `raspberrypi.local` | Taskfile (SSH/rsync) |
+| `PI_USER` | `pi` | Taskfile (SSH/rsync) |
+| `PI_DIR` | `/home/pi/tankbot` | Taskfile (deploy path) |
+| `ROBOT_URL` | `ws://localhost:9000` | Phoenix web app, vision engine |
+
+### First-time setup
+
+```bash
 task setup        # installs uv on Pi, deploys code, installs Phoenix deps, installs vision deps
 ```
 

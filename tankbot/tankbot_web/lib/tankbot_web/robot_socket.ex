@@ -6,11 +6,12 @@ defmodule TankbotWeb.RobotSocket do
   use GenServer
   require Logger
 
-  @robot_url "ws://192.168.178.45:9000"
+  @default_robot_url "ws://localhost:9000"
   @reconnect_interval 3_000
 
   def start_link(opts \\ []) do
-    url = Keyword.get(opts, :url, @robot_url)
+    default_url = System.get_env("ROBOT_URL", @default_robot_url)
+    url = Keyword.get(opts, :url, default_url)
     GenServer.start_link(__MODULE__, url, name: __MODULE__)
   end
 
