@@ -263,6 +263,10 @@ class SplatSLAM:
 
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
+        # MASt3R expects float32 in [0.0, 1.0] — resize_img does np.uint8(img * 255)
+        # so passing uint8 directly causes overflow and corrupted images
+        img_float = img_rgb.astype(np.float32) / 255.0
+
         self._frame_idx += 1
         t0 = time.monotonic()
 
@@ -277,9 +281,9 @@ class SplatSLAM:
             else:
                 T_WC = self._last_frame.T_WC
 
-            # create_frame handles resize + normalization internally
+            # create_frame expects float32 [0,1] RGB numpy array
             frame = create_frame(
-                self._frame_idx, img_rgb, T_WC,
+                self._frame_idx, img_float, T_WC,
                 img_size=self._img_size, device=str(self._device),
             )
 
@@ -299,10 +303,34 @@ class SplatSLAM:
                 add_new_kf, match_info, try_reloc = self._tracker.track(frame)
 
                 if try_reloc:
-                    log.warning("Tracking lost — relocalization requested (frame %d)", self._frame_idx)
+                    if not hasattr(self, '_reloc_count'):
+                        self._reloc_count = 0
+                    self._reloc_count += 1
+                    if self._reloc_count == 1 or self._reloc_count % 30 == 0:
+                        log.warning(
+                            "Tracking lost (frame %d, %d consecutive). Move camera toward known area.",
+                            self._frame_idx, self._reloc_count,
+                        )
                     self._states.set_mode(Mode.RELOC)
+                else:
+                    self._reloc_count = 0
 
                 self._states.set_frame(frame)
+
+                # Log tracking diagnostics every 10 frames
+                if self._frame_idx % 10 == 0:
+                    pose = frame.T_WC.matrix().detach().cpu().numpy()
+                    if pose.ndim == 3:
+                        pose = pose[0]
+                    tx, ty, tz = pose[0, 3], pose[1, 3], pose[2, 3]
+                    # Extract rotation angle from rotation matrix
+                    import math
+                    trace = pose[0, 0] + pose[1, 1] + pose[2, 2]
+                    angle = math.degrees(math.acos(max(-1, min(1, (trace - 1) / 2))))
+                    log.info(
+                        "Track %d: pos=[%.3f,%.3f,%.3f] rot=%.1f° kf=%s reloc=%s",
+                        self._frame_idx, tx, ty, tz, angle, add_new_kf, try_reloc,
+                    )
 
                 if add_new_kf:
                     self._keyframes.append(frame)
@@ -425,24 +453,10 @@ class SplatSLAM:
                 if pts.ndim == 3:
                     pts = pts[0]  # Remove batch dim
 
-                # Extract colors from uimg
-                # uimg values are in 0..0.004 range (double-divided by 255 in create_frame)
+                # Extract colors from uimg (float32 0-1 range, RGB order)
                 mask_cpu = mask.cpu()
-                n_pts = mask_cpu.sum().item()
-                colors = np.full((n_pts, 3), 128, dtype=np.uint8)  # grey placeholder
-                try:
-                    h, w = kf.h, kf.w
-                    img_flat = uimg.reshape(-1, 3)
-                    raw = img_flat[mask_cpu].numpy()
-                    if raw.max() < 0.01:
-                        # Double-divided: scale by 255^2
-                        colors = (raw * 65025).clip(0, 255).astype(np.uint8)
-                    elif raw.max() <= 1.0:
-                        colors = (raw * 255).clip(0, 255).astype(np.uint8)
-                    else:
-                        colors = raw.clip(0, 255).astype(np.uint8)
-                except Exception:
-                    pass  # Keep grey fallback
+                img_flat = uimg.reshape(-1, 3)
+                colors = (img_flat[mask_cpu].numpy() * 255).clip(0, 255).astype(np.uint8)
 
                 all_points.append(pts)
                 all_colors.append(colors)
