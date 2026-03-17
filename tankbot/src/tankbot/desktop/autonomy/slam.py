@@ -46,6 +46,8 @@ class SLAMResult:
     camera_pose: np.ndarray      # 4×4 float64 (world-from-camera)
     tracking_quality: float      # 0..1
     num_points: int              # total points in map
+    tracking_lost: bool = False  # True when tracker requests relocalization
+    new_keyframe: bool = False   # True when a new keyframe was just added
 
 
 def _find_mast3r_root() -> Path:
@@ -73,22 +75,27 @@ def _ensure_on_path() -> Path:
 
 def _run_backend_wrapper(cfg, model, states, keyframes, mast3r_root):
     """Backend process entry point — runs global optimization + loop closure."""
-    import os, sys
+    import os, sys, traceback
     os.chdir(str(mast3r_root))  # Checkpoints use relative paths
-    # Add MASt3R-SLAM to path directly (can't use _find_mast3r_root after chdir)
     if str(mast3r_root) not in sys.path:
         sys.path.insert(0, str(mast3r_root))
 
-    from mast3r_slam.config import set_global_config, config
-    from mast3r_slam.global_opt import FactorGraph
-    from mast3r_slam.mast3r_utils import load_retriever
-    from mast3r_slam.frame import Mode
+    try:
+        from mast3r_slam.config import set_global_config, config
+        from mast3r_slam.global_opt import FactorGraph
+        from mast3r_slam.mast3r_utils import load_retriever
+        from mast3r_slam.frame import Mode
 
-    set_global_config(cfg)
-    device = keyframes.device
+        set_global_config(cfg)
+        device = keyframes.device
 
-    factor_graph = FactorGraph(model, keyframes, keyframes.K, device)
-    retrieval_database = load_retriever(model)
+        factor_graph = FactorGraph(model, keyframes, keyframes.K, device)
+        retrieval_database = load_retriever(model)
+        print("[Backend] Initialized successfully", flush=True)
+    except Exception as e:
+        print(f"[Backend] FATAL: Failed to initialize: {e}", flush=True)
+        traceback.print_exc()
+        return
 
     mode = states.get_mode()
     while mode is not Mode.TERMINATED:
@@ -128,27 +135,37 @@ def _run_backend_wrapper(cfg, model, states, keyframes, mast3r_root):
             lc_inds = set(retrieval_inds)
             lc_inds.discard(idx - 1)
             if len(lc_inds) > 0:
-                log.info("Loop closure detected at keyframe %d: %s", idx, lc_inds)
+                print(f"[Backend] Loop closure at KF {idx} → matched KFs {lc_inds}", flush=True)
 
             kf_idx = list(set(kf_idx) - {idx})
             frame_idx = [idx] * len(kf_idx)
+
+            n_factors_before = len(factor_graph.ii) if hasattr(factor_graph, 'ii') else 0
+
             if kf_idx:
                 factor_graph.add_factors(
                     kf_idx, frame_idx, config["local_opt"]["min_match_frac"]
                 )
 
+            n_factors_after = len(factor_graph.ii) if hasattr(factor_graph, 'ii') else 0
+
             with states.lock:
                 states.edges_ii[:] = factor_graph.ii.cpu().tolist()
                 states.edges_jj[:] = factor_graph.jj.cpu().tolist()
 
-            # Solve — no calibration mode uses ray-based optimization
-            factor_graph.solve_GN_rays()
+            # NOTE: solve_GN_rays() disabled — it collapses Sim3 scale in uncalibrated mode
+            # TODO: enable when we add camera intrinsics (calibration mode)
+            # factor_graph.solve_GN_rays()
+
+            print(f"[Backend] KF {idx}: {n_factors_after} factors, retrieval={retrieval_inds} (solve disabled)", flush=True)
 
             with states.lock:
                 if len(states.global_optimizer_tasks) > 0:
                     states.global_optimizer_tasks.pop(0)
         except Exception as e:
-            log.error("Backend optimization error: %s", e)
+            import traceback
+            print(f"[Backend] ERROR optimizing KF {idx}: {e}", flush=True)
+            traceback.print_exc()
             with states.lock:
                 if len(states.global_optimizer_tasks) > 0:
                     states.global_optimizer_tasks.pop(0)
@@ -313,6 +330,9 @@ class SplatSLAM:
                         )
                     self._states.set_mode(Mode.RELOC)
                 else:
+                    if getattr(self, '_reloc_count', 0) > 0:
+                        # Recovered from reloc — re-enable backend optimization
+                        self._states.set_mode(Mode.TRACKING)
                     self._reloc_count = 0
 
                 self._states.set_frame(frame)
@@ -332,9 +352,11 @@ class SplatSLAM:
                         self._frame_idx, tx, ty, tz, angle, add_new_kf, try_reloc,
                     )
 
+                self._new_kf_this_frame = False
                 if add_new_kf:
                     self._keyframes.append(frame)
                     self._states.queue_global_optimization(len(self._keyframes) - 1)
+                    self._new_kf_this_frame = True
                     log.info("New keyframe added (total: %d)", len(self._keyframes))
 
                 self._last_frame = frame
@@ -357,6 +379,8 @@ class SplatSLAM:
             pose_matrix = self._last_pose
 
         # Extract depth from the dense point map
+        # MASt3R Sim3 mode: depths are relative, not metric.
+        # depth_scale is dynamically calibrated against ultrasonic in vision.py
         try:
             X = frame.X_canon  # [H*W, 3] points in camera frame
             if X is not None:
@@ -399,6 +423,8 @@ class SplatSLAM:
             camera_pose=pose_matrix,
             tracking_quality=quality,
             num_points=num_points,
+            tracking_lost=getattr(self, '_reloc_count', 0) > 0,
+            new_keyframe=getattr(self, '_new_kf_this_frame', False),
         )
 
     def export_ply(self, path: str) -> bool:

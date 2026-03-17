@@ -126,6 +126,11 @@ tasks:
     cmds:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug
 
+  vision:record:
+    desc: Record manual driving — SLAM + your inputs saved to recordings/
+    cmds:
+      - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug --record
+
   slam:setup:
     desc: Clone MASt3R-SLAM and build CUDA extensions
     env:

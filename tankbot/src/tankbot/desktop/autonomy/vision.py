@@ -35,31 +35,38 @@ log = logging.getLogger(__name__)
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 
-# Speeds (duty values, max 4095)
-CRUISE_SPEED = 1200
+# Speeds (duty values, max 4095) — calibrated from human driving (2000 forward)
+EXPLORE_SPEED = 1500     # cautious speed in unknown territory
+CRUISE_SPEED = 2000      # confident speed in mapped territory
 SLOW_SPEED = 1100
-TURN_SPEED = 1300
+TURN_SPEED = 1500
 BACKUP_SPEED = 1200
 MIN_DUTY = 1000
 
-# Depth thresholds in METERS (real distances from SLAM-rendered depth)
-DEPTH_STOP_M = 0.40       # closer than 40 cm → back up
-DEPTH_SLOW_M = 1.00       # closer than 1 m → slow down and steer
-DEPTH_CLEAR_M = 1.50      # farther than 1.5 m → considered clear
+# Pulse-and-coast: short burst then stop to keep speed low
+PULSE_DURATION = 0.25   # seconds of motor power per step
+COAST_PAUSE = 0.20      # seconds of coasting (motors off) between pulses
+
+# Stuck detection
+STUCK_POSITION_THRESHOLD = 0.02  # meters — less movement than this = stuck
+STUCK_FRAME_LIMIT = 15           # consecutive "no movement" frames before declaring stuck
+
+# Ultrasonic thresholds in CM — calibrated from human driving recording
+US_STOP = 40              # closer than 40 cm → turn away (human never went below 46cm)
+US_SLOW = 60              # closer than 60 cm → slow down and steer
+US_CLEAR = 100            # farther than 1m → full confidence
+
+# Initial scan: rotate in place to build panoramic map before moving
+INITIAL_SCAN_STEPS = 8    # number of turn pulses at startup
 
 # We divide the frame into three vertical strips for steering decisions
 STRIP_LEFT = (0, FRAME_WIDTH // 3)
 STRIP_CENTER = (FRAME_WIDTH // 3, 2 * FRAME_WIDTH // 3)
 STRIP_RIGHT = (2 * FRAME_WIDTH // 3, FRAME_WIDTH)
 
-# Ultrasonic thresholds (cm)
-US_STOP = 20
-US_SLOW = 50
 US_MAX_TRUSTED = 200
 
 # Timing (seconds)
-BACKUP_DURATION = 0.4
-TURN_AFTER_BACKUP = 0.35
 SCAN_PAUSE = 0.6
 
 # State hysteresis
@@ -88,14 +95,16 @@ class State(str, Enum):
     STOPPED = "stopped"
 
 
-# Force debug mode until SLAM tracking is validated
-FORCE_DEBUG = True
+# Set True to prevent motor commands regardless of --debug flag
+FORCE_DEBUG = False
 
 
 class VisionEngine:
     def __init__(self, robot_url: str = "", debug: bool = False,
-                 splat_dir: str = "") -> None:
+                 splat_dir: str = "", record: bool = False) -> None:
         debug = debug or FORCE_DEBUG
+        self._record = record
+        self._record_file = None
         robot_url = robot_url or os.environ.get("ROBOT_URL", "ws://localhost:9000")
         self._client = RobotClient(robot_url)
         self._slam = SplatSLAM()
@@ -115,6 +124,13 @@ class VisionEngine:
         self._last_ply_export = 0.0
         self._send_counter = 0
         self._frame_count = 0
+        self._last_nav_pose = None
+        self._stuck_count = 0
+        self._last_kf_frame = 0    # frame count when last keyframe was added
+        self._kf_rate = 0.0        # keyframes per frame (rolling)
+        self._initial_scan_done = False
+        self._scan_steps_remaining = 0
+        # depth_scale no longer used — US for distance, SLAM for steering only
 
     @staticmethod
     def _default_splat_dir() -> str:
@@ -251,6 +267,52 @@ class VisionEngine:
                               list(slam_data.keys()) if slam_data else None)
 
     # ------------------------------------------------------------------
+    # Recording
+    # ------------------------------------------------------------------
+    def _init_recording(self) -> None:
+        """Start recording driving data to CSV."""
+        import csv
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        path = f"recordings/drive_{ts}.csv"
+        os.makedirs("recordings", exist_ok=True)
+        self._record_file = open(path, "w", newline="")
+        self._record_writer = csv.writer(self._record_file)
+        self._record_writer.writerow([
+            "timestamp", "frame_idx",
+            "motor_left", "motor_right",
+            "us_distance",
+            "slam_strip_l", "slam_strip_c", "slam_strip_r",
+            "pose_x", "pose_y", "pose_z", "pose_rot_deg",
+            "tracking_lost", "num_keyframes",
+        ])
+        log.info("Recording to %s", path)
+
+    def _record_frame(self, slam_result, us_distance: float,
+                      strips: tuple, motor_left: int, motor_right: int) -> None:
+        """Record one frame of driving data."""
+        if self._record_writer is None:
+            return
+        import math
+        pose = slam_result.camera_pose if slam_result else None
+        if pose is not None:
+            tx, ty, tz = pose[0, 3], pose[1, 3], pose[2, 3]
+            trace = pose[0, 0] + pose[1, 1] + pose[2, 2]
+            rot = math.degrees(math.acos(max(-1, min(1, (trace - 1) / 2))))
+        else:
+            tx = ty = tz = rot = 0.0
+
+        self._record_writer.writerow([
+            f"{time.monotonic():.3f}", self._frame_count,
+            motor_left, motor_right,
+            f"{us_distance:.1f}",
+            f"{strips[0]:.3f}", f"{strips[1]:.3f}", f"{strips[2]:.3f}",
+            f"{tx:.4f}", f"{ty:.4f}", f"{tz:.4f}", f"{rot:.1f}",
+            1 if (slam_result and slam_result.tracking_lost) else 0,
+            slam_result.num_points if slam_result else 0,
+        ])
+        self._record_file.flush()
+
+    # ------------------------------------------------------------------
     # Decision loop
     # ------------------------------------------------------------------
     async def _decision_loop(self) -> None:
@@ -271,23 +333,59 @@ class VisionEngine:
             loop = asyncio.get_running_loop()
             analysis = await loop.run_in_executor(None, self._analyse_frame, frame)
 
-            depth_strips = analysis["depth_strips"]
-            center_dist = analysis["center_dist"]
+            raw_depth_strips = analysis["depth_strips"]
+            raw_center_dist = analysis["center_dist"]
             slam_result = analysis["slam_result"]
-            strip_l, strip_c, strip_r = depth_strips
             self._frame_count += 1
 
             raw_us = self._latest_telemetry.get("distance", -1)
             us_distance = self._filter_distance(raw_us)
-            # Clamp to finite value — JSON can't represent Infinity
             if us_distance == float("inf"):
                 us_distance = -1.0
+
+            # SLAM depth strips are relative (no calibration needed for steering)
+            strip_l, strip_c, strip_r = raw_depth_strips
+            center_dist = raw_center_dist
+            depth_strips = raw_depth_strips
+
+            # Record driving data (captures YOUR motor commands from the UI)
+            if self._record and self._record_writer:
+                motor = self._latest_telemetry.get("motor", {})
+                self._record_frame(
+                    slam_result, us_distance, raw_depth_strips,
+                    motor.get("left", 0), motor.get("right", 0),
+                )
 
             # Export PLY periodically (in executor since it touches disk)
             if slam_result is not None:
                 await loop.run_in_executor(None, self._maybe_export_ply)
 
             await self._send_vision_status(us_distance, depth_strips, slam_result)
+
+            # === Initial scan: rotate in place to build panoramic map ===
+            if not self._initial_scan_done and not self._debug:
+                if self._scan_steps_remaining == 0:
+                    self._scan_steps_remaining = INITIAL_SCAN_STEPS
+                    log.info("Starting initial scan (%d steps)", INITIAL_SCAN_STEPS)
+
+                # If tracking lost during scan, wait for recovery
+                if slam_result is not None and slam_result.tracking_lost:
+                    await self._stop()
+                    await asyncio.sleep(0.3)
+                    continue
+
+                self._set_state(State.SCANNING)
+                # High power, short pulse — overcome friction without overshooting
+                await self._motor(-TURN_SPEED, TURN_SPEED)
+                await asyncio.sleep(0.35)
+                await self._stop()
+                await asyncio.sleep(0.6)  # long pause for SLAM to track the new view
+                self._scan_steps_remaining -= 1
+
+                if self._scan_steps_remaining <= 0:
+                    self._initial_scan_done = True
+                    log.info("Initial scan complete — starting exploration")
+                continue
 
             # During warmup (no depth yet), stay still
             if slam_result is None:
@@ -297,96 +395,125 @@ class VisionEngine:
                 await asyncio.sleep(0.1)
                 continue
 
-            # After bootstrap period, gate on tracking quality
-            bootstrapping = self._frame_count < TRACKING_BOOTSTRAP_FRAMES
-            if not bootstrapping and slam_result.tracking_quality < TRACKING_LOSS_THRESHOLD:
-                self._set_state(State.STOPPED)
-                if self._send_counter % 30 == 0:
-                    log.warning(
-                        "Tracking quality low (%.2f), gaussians=%d, stopping",
-                        slam_result.tracking_quality, slam_result.num_points,
-                    )
+            # Tracking lost — stop and turn to find known features. NEVER reverse.
+            if slam_result.tracking_lost:
+                if not hasattr(self, '_lost_count'):
+                    self._lost_count = 0
+                self._lost_count += 1
+
                 if not self._debug:
-                    await self._stop()
+                    if self._lost_count == 1:
+                        log.info("Tracking lost — stopping")
+                        await self._stop()
+                    elif self._lost_count % 15 == 0:
+                        # Periodically turn in place to find known features
+                        log.info("Tracking lost (%d frames) — turning to re-acquire", self._lost_count)
+                        self._set_state(State.SCANNING)
+                        await self._motor(-TURN_SPEED, TURN_SPEED)
+                        await asyncio.sleep(0.35)
+                        await self._stop()
+
                 await asyncio.sleep(0.1)
                 continue
+            else:
+                if getattr(self, '_lost_count', 0) > 0:
+                    log.info("Tracking recovered after %d lost frames", self._lost_count)
+                self._lost_count = 0
 
-            # The most free space in any direction
-            best_strip = max(strip_l, strip_c, strip_r)
-            # The least free space (tightest constraint)
-            worst_strip = min(strip_l, strip_c, strip_r)
+            # SLAM strips are relative — use for steering direction only
+            # Ultrasonic is absolute cm — use for speed and stop/go decisions
+            total_strip = strip_l + strip_c + strip_r
 
             if self._debug:
                 if self._frame_count % 30 == 0:
-                    log.info(
-                        "depth L=%.2fm C=%.2fm R=%.2fm | center=%.2fm | US=%.1fcm | points=%d | quality=%.2f",
-                        strip_l, strip_c, strip_r, center_dist,
-                        us_distance if us_distance != float("inf") else -1,
-                        slam_result.num_points,
-                        slam_result.tracking_quality,
-                    )
+                    log.info("US=%.1fcm | SLAM L/C/R=%.1f/%.1f/%.1f | points=%d",
+                             us_distance, strip_l, strip_c, strip_r, slam_result.num_points)
                 await asyncio.sleep(0.1)
                 continue
 
-            # === TIER 1: Emergency — something right in our face ===
-            emergency_us = 0 < us_distance < US_STOP
-            emergency_depth = worst_strip < DEPTH_STOP_M
+            # === Stuck detection ===
+            if slam_result is not None and not slam_result.tracking_lost:
+                import numpy as np
+                cur_pos = slam_result.camera_pose[:3, 3]
+                if self._last_nav_pose is not None:
+                    movement = np.linalg.norm(cur_pos - self._last_nav_pose)
+                    if movement < STUCK_POSITION_THRESHOLD:
+                        self._stuck_count += 1
+                    else:
+                        self._stuck_count = 0
+                    self._last_nav_pose = cur_pos
+                else:
+                    self._last_nav_pose = cur_pos
 
-            if emergency_us or emergency_depth:
-                self._set_state(State.BACKING_UP)
+                if self._stuck_count >= STUCK_FRAME_LIMIT:
+                    log.info("Stuck detected — turning")
+                    self._set_state(State.SCANNING)
+                    if strip_l > strip_r:
+                        await self._motor(-TURN_SPEED, TURN_SPEED)
+                    else:
+                        await self._motor(TURN_SPEED, -TURN_SPEED)
+                    await asyncio.sleep(0.35)
+                    await self._stop()
+                    self._stuck_count = 0
+                    self._last_nav_pose = None
+                    await asyncio.sleep(0.4)
+                    continue
+
+            # === TIER 1: Emergency — ultrasonic says too close ===
+            if 0 < us_distance < US_STOP:
+                self._set_state(State.SCANNING)
                 await self._stop()
-                await asyncio.sleep(0.05)
-                await self._motor(-BACKUP_SPEED, -BACKUP_SPEED)
-                await asyncio.sleep(BACKUP_DURATION)
-                # Turn toward the most open side
                 if strip_l > strip_r:
                     await self._motor(-TURN_SPEED, TURN_SPEED)
                 else:
                     await self._motor(TURN_SPEED, -TURN_SPEED)
-                await asyncio.sleep(TURN_AFTER_BACKUP)
-                self._last_turn_dir *= -1
+                await asyncio.sleep(0.35)
                 await self._stop()
-                self._set_state(State.SCANNING)
-                await asyncio.sleep(SCAN_PAUSE)
+                await asyncio.sleep(0.4)
                 continue
 
-            # === TIER 2: Boxed in — no direction has much room ===
-            if best_strip < DEPTH_SLOW_M:
-                # Turn in place toward whichever strip is most open
-                self._set_state(State.SCANNING)
-                if strip_l >= strip_r:
-                    await self._motor(-TURN_SPEED, TURN_SPEED)
-                else:
-                    await self._motor(TURN_SPEED, -TURN_SPEED)
-                await asyncio.sleep(0.15)
-                continue
+            # === TIER 2: Ultrasonic says getting close — slow zone ===
+            # Clearance: 0 = at US_STOP, 1 = at US_CLEAR or beyond
+            if us_distance > 0:
+                clearance = max(0.0, min(1.0, (us_distance - US_STOP) / (US_CLEAR - US_STOP)))
+            else:
+                # No US reading — trust SLAM strips relatively: if all similar, assume clear
+                clearance = 0.7  # moderate confidence
 
-            # === TIER 3: Navigate toward the most free space ===
-            clearance = max(0.0, min(1.0,
-                (center_dist - DEPTH_STOP_M) / (DEPTH_CLEAR_M - DEPTH_STOP_M)
-            ))
-            base_speed = int(MIN_DUTY + (CRUISE_SPEED - MIN_DUTY) * clearance)
-
-            total = strip_l + strip_c + strip_r
-            if total > 0.01:
-                bias = (strip_r - strip_l) / total
+            # === Steering from SLAM depth strips (relative, no scale needed) ===
+            if total_strip > 0.01:
+                bias = (strip_r - strip_l) / total_strip
             else:
                 bias = 0.0
 
-            steer = bias * 0.5
-            left_speed = int(base_speed * (1 + steer))
-            right_speed = int(base_speed * (1 - steer))
+            # Steer harder when closer to obstacles
+            steer_strength = 0.3 + 0.5 * (1.0 - clearance)
+            steer = bias * steer_strength
 
-            left_speed = max(MIN_DUTY, min(left_speed, CRUISE_SPEED))
-            right_speed = max(MIN_DUTY, min(right_speed, CRUISE_SPEED))
+            # === Familiarity-based speed ===
+            if slam_result.new_keyframe:
+                self._last_kf_frame = self._frame_count
+            frames_since_kf = self._frame_count - self._last_kf_frame
+            familiarity = min(1.0, frames_since_kf / 50.0)
+            top_speed = int(EXPLORE_SPEED + (CRUISE_SPEED - EXPLORE_SPEED) * familiarity)
 
-            if center_dist < DEPTH_SLOW_M:
+            base_speed = int(MIN_DUTY + (top_speed - MIN_DUTY) * clearance)
+            left_speed = max(MIN_DUTY, min(int(base_speed * (1 + steer)), CRUISE_SPEED))
+            right_speed = max(MIN_DUTY, min(int(base_speed * (1 - steer)), CRUISE_SPEED))
+
+            if clearance < 0.3:
                 self._set_state(State.AVOIDING)
+            elif clearance < 0.7:
+                self._set_state(State.CRUISING)
             else:
                 self._set_state(State.CRUISING)
 
+            # Pulse-and-coast
+            pulse = PULSE_DURATION + 0.15 * familiarity
             await self._motor(left_speed, right_speed)
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(pulse)
+            await self._stop()
+            await asyncio.sleep(COAST_PAUSE)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -394,6 +521,9 @@ class VisionEngine:
     async def run(self) -> None:
         self._running = True
         self._load_models()
+
+        if self._record:
+            self._init_recording()
 
         self._client.on_frame(self._on_frame)
         self._client.on_telemetry(self._on_telemetry)
@@ -414,6 +544,9 @@ class VisionEngine:
         finally:
             if not self._debug:
                 await self._client.send_stop()
+            if self._record_file:
+                self._record_file.close()
+                log.info("Recording saved")
             await self._client.close()
             log.info("Vision engine stopped")
 
@@ -431,9 +564,11 @@ def main() -> None:
     parser.add_argument("--splat-dir", default="", help="Directory for PLY export (default: Phoenix static assets)")
     parser.add_argument("--debug", action="store_true",
                         help="Debug mode: run SLAM but send no motor commands")
+    parser.add_argument("--record", action="store_true",
+                        help="Record driving data (use with --debug while driving manually)")
     args = parser.parse_args()
 
-    engine = VisionEngine(robot_url=args.robot, debug=args.debug, splat_dir=args.splat_dir)
+    engine = VisionEngine(robot_url=args.robot, debug=args.debug, splat_dir=args.splat_dir, record=args.record)
     asyncio.run(engine.run())
 
 
