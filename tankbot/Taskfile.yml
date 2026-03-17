@@ -127,18 +127,24 @@ tasks:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug
 
   slam:setup:
-    desc: Clone MonoGS and build CUDA extensions for Gaussian Splatting SLAM
+    desc: Clone MASt3R-SLAM and build CUDA extensions
     env:
       TORCH_CUDA_ARCH_LIST: "8.9"
     cmds:
       - mkdir -p vendor
       - >-
-        test -d vendor/MonoGS ||
-        git clone --recursive https://github.com/muskie82/MonoGS.git vendor/MonoGS
-      - bash scripts/patch-monogs.sh vendor/MonoGS
+        test -d vendor/MASt3R-SLAM ||
+        git clone --recursive https://github.com/rmurai0610/MASt3R-SLAM.git vendor/MASt3R-SLAM
+      - bash scripts/patch-mast3r-slam.sh vendor/MASt3R-SLAM
       - uv pip install --python .venv/bin/python setuptools
-      - uv pip install --no-build-isolation --python .venv/bin/python vendor/MonoGS/submodules/diff-gaussian-rasterization
-      - uv pip install --no-build-isolation --python .venv/bin/python vendor/MonoGS/submodules/simple-knn
+      - uv pip install --no-build-isolation --python .venv/bin/python -e vendor/MASt3R-SLAM/thirdparty/mast3r
+      - uv pip install --no-build-isolation --python .venv/bin/python -e vendor/MASt3R-SLAM
+      # Download model checkpoints (~2.3 GB)
+      - >-
+        test -f vendor/MASt3R-SLAM/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth ||
+        (mkdir -p vendor/MASt3R-SLAM/checkpoints &&
+        wget -P vendor/MASt3R-SLAM/checkpoints/
+        https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth)
 
   # ---------------------------------------------------------------------------
   # Development — lint, typecheck, format

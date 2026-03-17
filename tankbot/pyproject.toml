@@ -85,6 +85,8 @@ module = [
     "cv2.*",
     "PIL.*",
     "plyfile.*",
-    "gaussian_splatting.*",
+    "mast3r_slam.*",
+    "mast3r.*",
+    "lietorch.*",
 ]
 ignore_missing_imports = true

@@ -25,11 +25,8 @@ export const SplatViewer = {
     this.animFrameId = null
     this.loading = false
     this.plyLoader = new PLYLoader()
-    // Map MonoGS SH DC coefficients → "sh_dc" attribute (itemSize 3)
-    // Format: { targetAttributeName: [sourcePropertyName, ...] }
-    this.plyLoader.setCustomPropertyNameMapping({
-      sh_dc: ["f_dc_0", "f_dc_1", "f_dc_2"],
-    })
+    // MASt3R-SLAM exports standard PLY with (x,y,z,red,green,blue)
+    // PLYLoader reads these natively — no custom mapping needed
 
     this._initScene()
     this._initRobotMarker()
@@ -142,34 +139,16 @@ export const SplatViewer = {
           this.pointCloud.material.dispose()
         }
 
-        // Extract colors from SH DC coefficients
-        // MonoGS stores: RGB = clamp(f_dc * SH_C0 + 0.5, 0, 1)
-        const shAttr = geometry.attributes.sh_dc
-        console.log("PLY attributes:", Object.keys(geometry.attributes), "sh_dc:", shAttr ? `itemSize=${shAttr.itemSize}` : "missing")
-
-        const count = geometry.attributes.position.count
-        let hasColor = false
-        if (shAttr && shAttr.itemSize === 3) {
-          const SH_C0 = 0.28209479177
-          const colors = new Float32Array(count * 3)
-          const sh = shAttr.array
-
-          for (let i = 0; i < count; i++) {
-            colors[i * 3] = Math.max(0, Math.min(1, sh[i * 3] * SH_C0 + 0.5))
-            colors[i * 3 + 1] = Math.max(0, Math.min(1, sh[i * 3 + 1] * SH_C0 + 0.5))
-            colors[i * 3 + 2] = Math.max(0, Math.min(1, sh[i * 3 + 2] * SH_C0 + 0.5))
-          }
-          geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3))
-          hasColor = true
-        }
+        // MASt3R-SLAM PLY has standard (red, green, blue) — PLYLoader
+        // reads these as geometry.attributes.color automatically
+        const hasColor = !!geometry.attributes.color
+        console.log("PLY attributes:", Object.keys(geometry.attributes), "hasColor:", hasColor)
 
         const material = new THREE.PointsMaterial({
-          size: 0.015,
+          size: 0.008,
           vertexColors: hasColor,
           color: hasColor ? 0xffffff : 0x44aaff,
           sizeAttenuation: true,
-          transparent: true,
-          opacity: 0.9,
         })
 
         this.pointCloud = new THREE.Points(geometry, material)

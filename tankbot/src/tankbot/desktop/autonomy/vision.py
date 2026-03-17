@@ -25,7 +25,7 @@ from enum import Enum
 from pathlib import Path
 
 from tankbot.desktop.autonomy.robot_client import RobotClient
-from tankbot.desktop.autonomy.slam import SplatSLAM, CameraIntrinsics
+from tankbot.desktop.autonomy.slam import SplatSLAM
 
 log = logging.getLogger(__name__)
 
@@ -88,12 +88,17 @@ class State(str, Enum):
     STOPPED = "stopped"
 
 
+# Force debug mode until SLAM tracking is validated
+FORCE_DEBUG = True
+
+
 class VisionEngine:
     def __init__(self, robot_url: str = "", debug: bool = False,
                  splat_dir: str = "") -> None:
+        debug = debug or FORCE_DEBUG
         robot_url = robot_url or os.environ.get("ROBOT_URL", "ws://localhost:9000")
         self._client = RobotClient(robot_url)
-        self._slam = SplatSLAM(CameraIntrinsics())
+        self._slam = SplatSLAM()
         self._latest_frame: bytes | None = None
         self._latest_telemetry: dict = {}
         self._running = False
@@ -219,20 +224,31 @@ class VisionEngine:
         # Build SLAM telemetry (sent every update)
         slam_data = None
         if slam_result is not None:
+            # Sanitize pose — replace NaN/inf with 0 for JSON safety
+            pose_flat = slam_result.camera_pose.flatten().tolist()
+            import math
+            pose_flat = [0.0 if (math.isnan(v) or math.isinf(v)) else round(v, 6) for v in pose_flat]
+
             slam_data = {
-                "tracking_quality": slam_result.tracking_quality,
-                "num_gaussians": slam_result.num_gaussians,
-                "camera_pose": slam_result.camera_pose.flatten().tolist(),
+                "tracking_quality": round(float(slam_result.tracking_quality), 3),
+                "num_gaussians": int(slam_result.num_points),
+                "camera_pose": pose_flat,
                 "ply_version": self._ply_version,
             }
 
-        await self._client.send_vision_status(
-            state=self._state.value,
-            detections=[],
-            distance=us_distance,
-            depth_strips=depth_strips,
-            slam_data=slam_data,
-        )
+        try:
+            await self._client.send_vision_status(
+                state=self._state.value,
+                detections=[],
+                distance=us_distance,
+                depth_strips=depth_strips,
+                slam_data=slam_data,
+            )
+        except Exception:
+            # Log full message for debugging JSON serialization issues
+            if self._send_counter % 30 == 0:
+                log.exception("Failed to send vision status, slam_data keys: %s",
+                              list(slam_data.keys()) if slam_data else None)
 
     # ------------------------------------------------------------------
     # Decision loop
@@ -263,6 +279,9 @@ class VisionEngine:
 
             raw_us = self._latest_telemetry.get("distance", -1)
             us_distance = self._filter_distance(raw_us)
+            # Clamp to finite value — JSON can't represent Infinity
+            if us_distance == float("inf"):
+                us_distance = -1.0
 
             # Export PLY periodically (in executor since it touches disk)
             if slam_result is not None:
@@ -285,7 +304,7 @@ class VisionEngine:
                 if self._send_counter % 30 == 0:
                     log.warning(
                         "Tracking quality low (%.2f), gaussians=%d, stopping",
-                        slam_result.tracking_quality, slam_result.num_gaussians,
+                        slam_result.tracking_quality, slam_result.num_points,
                     )
                 if not self._debug:
                     await self._stop()
@@ -298,21 +317,14 @@ class VisionEngine:
             worst_strip = min(strip_l, strip_c, strip_r)
 
             if self._debug:
-                log.info(
-                    "depth L=%.2fm C=%.2fm R=%.2fm | center=%.2fm | US=%.1fcm | gaussians=%d | quality=%.2f",
-                    strip_l, strip_c, strip_r, center_dist,
-                    us_distance if us_distance != float("inf") else -1,
-                    slam_result.num_gaussians,
-                    slam_result.tracking_quality,
-                )
-                if worst_strip < DEPTH_STOP_M or (0 < us_distance < US_STOP):
-                    self._set_state(State.BACKING_UP)
-                elif best_strip < DEPTH_SLOW_M:
-                    self._set_state(State.STOPPED)
-                elif center_dist < DEPTH_SLOW_M:
-                    self._set_state(State.AVOIDING)
-                else:
-                    self._set_state(State.CRUISING)
+                if self._frame_count % 30 == 0:
+                    log.info(
+                        "depth L=%.2fm C=%.2fm R=%.2fm | center=%.2fm | US=%.1fcm | points=%d | quality=%.2f",
+                        strip_l, strip_c, strip_r, center_dist,
+                        us_distance if us_distance != float("inf") else -1,
+                        slam_result.num_points,
+                        slam_result.tracking_quality,
+                    )
                 await asyncio.sleep(0.1)
                 continue
 
