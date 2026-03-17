@@ -187,20 +187,34 @@ export const SplatViewer = {
   },
 
   _updateRobotMarker(poseFlat) {
+    // poseFlat is T_WC (world-from-camera) 4x4 matrix in row-major order
+    // Three.js uses column-major, so we transpose
     const m = new THREE.Matrix4()
     m.fromArray(poseFlat)
+    m.transpose()
 
-    const mInv = m.clone().invert()
-
+    // Extract position from T_WC (translation column)
     const pos = new THREE.Vector3()
-    pos.setFromMatrixPosition(mInv)
+    pos.setFromMatrixPosition(m)
 
-    const forward = new THREE.Vector3(0, 0, -1)
-    forward.applyMatrix4(new THREE.Matrix4().extractRotation(mInv))
+    // Apply same Y/Z flip as PLY export (camera → Three.js convention)
+    pos.y = -pos.y
+    pos.z = -pos.z
+
+    // Forward direction: camera looks along +Z in MASt3R convention
+    const forward = new THREE.Vector3(0, 0, 1)
+    forward.applyMatrix4(new THREE.Matrix4().extractRotation(m))
+    forward.y = -forward.y
+    forward.z = -forward.z
 
     this.robotMarker.position.copy(pos)
     this.robotMarker.lookAt(pos.x + forward.x, pos.y + forward.y, pos.z + forward.z)
     this.robotMarker.visible = true
+
+    if (!this._markerLogCount) this._markerLogCount = 0
+    if (this._markerLogCount++ % 60 === 0) {
+      console.log("Robot pos:", pos.x.toFixed(3), pos.y.toFixed(3), pos.z.toFixed(3))
+    }
 
     // Trail — throttled
     if (!this._trailCounter) this._trailCounter = 0

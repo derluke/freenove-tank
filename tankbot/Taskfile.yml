@@ -139,12 +139,20 @@ tasks:
       - uv pip install --python .venv/bin/python setuptools
       - uv pip install --no-build-isolation --python .venv/bin/python -e vendor/MASt3R-SLAM/thirdparty/mast3r
       - uv pip install --no-build-isolation --python .venv/bin/python -e vendor/MASt3R-SLAM
-      # Download model checkpoints (~2.3 GB)
+      # Download model checkpoints (~2.6 GB total)
+      - mkdir -p vendor/MASt3R-SLAM/checkpoints
       - >-
         test -f vendor/MASt3R-SLAM/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth ||
-        (mkdir -p vendor/MASt3R-SLAM/checkpoints &&
         wget -P vendor/MASt3R-SLAM/checkpoints/
-        https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth)
+        https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth
+      - >-
+        test -f vendor/MASt3R-SLAM/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth ||
+        wget -P vendor/MASt3R-SLAM/checkpoints/
+        https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth
+      - >-
+        test -f vendor/MASt3R-SLAM/checkpoints/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_codebook.pkl ||
+        wget -P vendor/MASt3R-SLAM/checkpoints/
+        https://download.europe.naverlabs.com/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_codebook.pkl
 
   # ---------------------------------------------------------------------------
   # Development — lint, typecheck, format

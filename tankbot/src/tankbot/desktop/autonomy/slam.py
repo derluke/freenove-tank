@@ -71,6 +71,89 @@ def _ensure_on_path() -> Path:
     return root
 
 
+def _run_backend_wrapper(cfg, model, states, keyframes, mast3r_root):
+    """Backend process entry point — runs global optimization + loop closure."""
+    import os, sys
+    os.chdir(str(mast3r_root))  # Checkpoints use relative paths
+    # Add MASt3R-SLAM to path directly (can't use _find_mast3r_root after chdir)
+    if str(mast3r_root) not in sys.path:
+        sys.path.insert(0, str(mast3r_root))
+
+    from mast3r_slam.config import set_global_config, config
+    from mast3r_slam.global_opt import FactorGraph
+    from mast3r_slam.mast3r_utils import load_retriever
+    from mast3r_slam.frame import Mode
+
+    set_global_config(cfg)
+    device = keyframes.device
+
+    factor_graph = FactorGraph(model, keyframes, keyframes.K, device)
+    retrieval_database = load_retriever(model)
+
+    mode = states.get_mode()
+    while mode is not Mode.TERMINATED:
+        mode = states.get_mode()
+        if mode == Mode.INIT or states.is_paused():
+            time.sleep(0.01)
+            continue
+
+        if mode == Mode.RELOC:
+            # Import relocalization from main.py
+            states.dequeue_reloc()
+            continue
+
+        idx = -1
+        with states.lock:
+            if len(states.global_optimizer_tasks) > 0:
+                idx = states.global_optimizer_tasks[0]
+        if idx == -1:
+            time.sleep(0.01)
+            continue
+
+        try:
+            # Graph construction — connect to previous + retrieved keyframes
+            kf_idx = []
+            n_consec = 1
+            for j in range(min(n_consec, idx)):
+                kf_idx.append(idx - 1 - j)
+
+            frame = keyframes[idx]
+            retrieval_inds = retrieval_database.update(
+                frame, add_after_query=True,
+                k=config["retrieval"]["k"],
+                min_thresh=config["retrieval"]["min_thresh"],
+            )
+            kf_idx += retrieval_inds
+
+            lc_inds = set(retrieval_inds)
+            lc_inds.discard(idx - 1)
+            if len(lc_inds) > 0:
+                log.info("Loop closure detected at keyframe %d: %s", idx, lc_inds)
+
+            kf_idx = list(set(kf_idx) - {idx})
+            frame_idx = [idx] * len(kf_idx)
+            if kf_idx:
+                factor_graph.add_factors(
+                    kf_idx, frame_idx, config["local_opt"]["min_match_frac"]
+                )
+
+            with states.lock:
+                states.edges_ii[:] = factor_graph.ii.cpu().tolist()
+                states.edges_jj[:] = factor_graph.jj.cpu().tolist()
+
+            # Solve — no calibration mode uses ray-based optimization
+            factor_graph.solve_GN_rays()
+
+            with states.lock:
+                if len(states.global_optimizer_tasks) > 0:
+                    states.global_optimizer_tasks.pop(0)
+        except Exception as e:
+            log.error("Backend optimization error: %s", e)
+            with states.lock:
+                if len(states.global_optimizer_tasks) > 0:
+                    states.global_optimizer_tasks.pop(0)
+
+
 class SplatSLAM:
     """Online monocular SLAM via MASt3R-SLAM.
 
@@ -105,7 +188,7 @@ class SplatSLAM:
         self._last_quality = 0.0
         self._last_pose = np.eye(4)
         self._initialized = False
-        self._img_size = 512  # MASt3R native resolution
+        self._img_size = 512  # MASt3R supports 224 or 512 only
 
     def load(self) -> None:
         """Initialize MASt3R-SLAM model and components."""
@@ -141,12 +224,30 @@ class SplatSLAM:
             buffer=self.MAX_KEYFRAMES,
         )
 
-        # Tracker
+        # Shared states for frontend/backend communication
+        from mast3r_slam.frame import SharedStates, Mode
+        self._states = SharedStates(
+            self._mp_manager,
+            h=self._model_h,
+            w=self._model_w,
+        )
+        self._states.set_mode(Mode.INIT)
+
+        # Tracker (frontend)
         self._tracker = FrameTracker(self._model, self._keyframes, self._device)
 
-        # Note: running without the backend optimization process for now.
-        # The tracker alone provides per-frame pose estimation + dense point maps.
-        # Backend global optimization can be added later for loop closure.
+        # Backend process — global optimization + loop closure
+        import torch.multiprocessing as mp
+        from mast3r_slam.config import config, set_global_config
+
+        self._model.share_memory()
+        self._backend_process = mp.Process(
+            target=_run_backend_wrapper,
+            args=(config, self._model, self._states, self._keyframes, self._mast3r_root),
+            daemon=True,
+        )
+        self._backend_process.start()
+        log.info("Backend optimization process started")
 
         log.info("MASt3R-SLAM loaded — no calibration mode (Sim3)")
 
@@ -163,6 +264,7 @@ class SplatSLAM:
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
         self._frame_idx += 1
+        t0 = time.monotonic()
 
         from mast3r_slam.frame import create_frame, Mode
         from mast3r_slam.mast3r_utils import mast3r_inference_mono
@@ -186,6 +288,9 @@ class SplatSLAM:
                 X_init, C_init = mast3r_inference_mono(self._model, frame)
                 frame.update_pointmap(X_init, C_init)
                 self._keyframes.append(frame)
+                self._states.queue_global_optimization(len(self._keyframes) - 1)
+                self._states.set_mode(Mode.TRACKING)
+                self._states.set_frame(frame)
                 self._initialized = True
                 self._last_frame = frame
                 log.info("MASt3R-SLAM initialized from first frame")
@@ -193,26 +298,26 @@ class SplatSLAM:
                 # Track against keyframes
                 add_new_kf, match_info, try_reloc = self._tracker.track(frame)
 
-                # Log tracking result periodically
-                if self._frame_idx % 30 == 0:
-                    pose = frame.T_WC.matrix().detach().cpu().numpy()
-                    if pose.ndim == 3:
-                        pose = pose[0]
-                    translation = pose[:3, 3]
-                    log.info(
-                        "Track frame %d: add_kf=%s reloc=%s pos=[%.3f, %.3f, %.3f]",
-                        self._frame_idx, add_new_kf, try_reloc,
-                        translation[0], translation[1], translation[2],
-                    )
+                if try_reloc:
+                    log.warning("Tracking lost — relocalization requested (frame %d)", self._frame_idx)
+                    self._states.set_mode(Mode.RELOC)
+
+                self._states.set_frame(frame)
 
                 if add_new_kf:
                     self._keyframes.append(frame)
+                    self._states.queue_global_optimization(len(self._keyframes) - 1)
                     log.info("New keyframe added (total: %d)", len(self._keyframes))
+
                 self._last_frame = frame
 
         except Exception:
             log.exception("MASt3R-SLAM frame processing failed")
             return None
+
+        elapsed = time.monotonic() - t0
+        if self._frame_idx % 10 == 0:
+            log.info("Frame %d: %.0fms (%.1f FPS)", self._frame_idx, elapsed * 1000, 1.0 / elapsed)
 
         # Extract pose (world-from-camera, 4x4)
         try:

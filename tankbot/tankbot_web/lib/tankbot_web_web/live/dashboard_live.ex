@@ -51,16 +51,17 @@ defmodule TankbotWebWeb.DashboardLive do
         slam_ply_version: slam["ply_version"] || socket.assigns.slam_ply_version
       )
 
-    # Push SLAM splat update to the JS 3D viewer hook
+    # Push camera pose to JS hook every frame (for robot marker)
+    # Push PLY version only when it changes (for point cloud reload)
     socket =
-      case slam["ply_version"] do
+      case slam["camera_pose"] do
         nil ->
           socket
 
-        ply_version ->
+        camera_pose ->
           push_event(socket, "splat_update", %{
-            ply_version: ply_version,
-            camera_pose: slam["camera_pose"],
+            ply_version: slam["ply_version"] || socket.assigns.slam_ply_version,
+            camera_pose: camera_pose,
             tracking_quality: slam["tracking_quality"] || 0.0,
             num_gaussians: slam["num_gaussians"] || 0
           })
