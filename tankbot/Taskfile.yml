@@ -112,19 +112,33 @@ tasks:
   # Desktop — Autonomy / Vision
   # ---------------------------------------------------------------------------
   vision:setup:
-    desc: Install Python desktop dependencies (YOLO, torch, etc.)
+    desc: Install Python desktop dependencies (torch, etc.)
     cmds:
       - uv sync --extra desktop
 
   vision:start:
-    desc: Start the autonomous vision engine
+    desc: Start the 3DGS SLAM vision engine
     cmds:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000
 
   vision:debug:
-    desc: Vision debug mode — YOLO + depth overlays, manual driving
+    desc: Vision debug mode — SLAM tracking, no motor commands
     cmds:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug
+
+  slam:setup:
+    desc: Clone MonoGS and build CUDA extensions for Gaussian Splatting SLAM
+    env:
+      TORCH_CUDA_ARCH_LIST: "8.9"
+    cmds:
+      - mkdir -p vendor
+      - >-
+        test -d vendor/MonoGS ||
+        git clone --recursive https://github.com/muskie82/MonoGS.git vendor/MonoGS
+      - bash scripts/patch-monogs.sh vendor/MonoGS
+      - uv pip install --python .venv/bin/python setuptools
+      - uv pip install --no-build-isolation --python .venv/bin/python vendor/MonoGS/submodules/diff-gaussian-rasterization
+      - uv pip install --no-build-isolation --python .venv/bin/python vendor/MonoGS/submodules/simple-knn
 
   # ---------------------------------------------------------------------------
   # Development — lint, typecheck, format
@@ -180,3 +194,4 @@ tasks:
       - task: pi:deploy
       - task: web:setup
       - task: vision:setup
+      - task: slam:setup

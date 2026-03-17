@@ -83,7 +83,7 @@ class RobotClient:
         detections: list[dict],
         distance: float,
         depth_strips: tuple[float, float, float] | None = None,
-        map_data: dict | None = None,
+        slam_data: dict | None = None,
     ) -> None:
         """Push vision engine state to the robot for dashboard display."""
         msg: dict = {
@@ -94,8 +94,8 @@ class RobotClient:
         }
         if depth_strips is not None:
             msg["depth"] = {"left": depth_strips[0], "center": depth_strips[1], "right": depth_strips[2]}
-        if map_data is not None:
-            msg["map"] = map_data
+        if slam_data is not None:
+            msg["slam"] = slam_data
         await self._send(msg)
 
     async def _send(self, data: dict) -> None:

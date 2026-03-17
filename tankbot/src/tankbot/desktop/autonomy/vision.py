@@ -1,43 +1,39 @@
-"""Vision pipeline — runs YOLO26 + Depth Pro on robot camera frames using the desktop GPU.
+"""Vision pipeline — runs 3D Gaussian Splatting SLAM on robot camera frames.
 
-Connects to the robot via WebSocket, receives frames, runs object detection
-and metric depth estimation, and sends motor commands back to navigate
-autonomously.
+Connects to the robot via WebSocket, receives frames, runs MonoGS SLAM
+for real-time dense mapping and depth estimation, and sends motor commands
+back to navigate autonomously.
 
-Behaviour: cautious exploration.  The robot creeps forward slowly, scans for
-obstacles with both camera (YOLO + metric depth) and ultrasonic, and steers /
-stops / backs up as needed.
+Behaviour: cautious exploration.  The robot creeps forward slowly, uses
+SLAM-rendered depth to detect obstacles, and steers / stops / backs up
+as needed.  The 3D Gaussian map is periodically exported as PLY for the
+web dashboard to display.
 
 Sensor fusion:
-  - YOLO26: identifies objects + bounding boxes
-  - Depth Pro (Apple): metric depth map in *meters* from a single frame —
-    detects every surface including walls, blankets, soft obstacles
+  - 3DGS SLAM (MonoGS): metric depth + camera pose from a single RGB stream
   - Ultrasonic: forward-only proximity, unreliable on soft surfaces
-  - Depth map is the primary obstacle sensor; YOLO + ultrasonic augment it.
+  - Depth from SLAM rendering is the primary obstacle sensor.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import math
+import os
 import time
 from enum import Enum
-
-import cv2
-import numpy as np
-import torch
-from PIL import Image
+from pathlib import Path
 
 from tankbot.desktop.autonomy.robot_client import RobotClient
+from tankbot.desktop.autonomy.slam import SplatSLAM, CameraIntrinsics
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Tuning knobs
 # ---------------------------------------------------------------------------
-FRAME_WIDTH = 400
-FRAME_HEIGHT = 300
+FRAME_WIDTH = 640
+FRAME_HEIGHT = 480
 
 # Speeds (duty values, max 4095)
 CRUISE_SPEED = 1200
@@ -46,7 +42,7 @@ TURN_SPEED = 1300
 BACKUP_SPEED = 1200
 MIN_DUTY = 1000
 
-# Depth thresholds in METERS (real distances from Depth Pro)
+# Depth thresholds in METERS (real distances from SLAM-rendered depth)
 DEPTH_STOP_M = 0.40       # closer than 40 cm → back up
 DEPTH_SLOW_M = 1.00       # closer than 1 m → slow down and steer
 DEPTH_CLEAR_M = 1.50      # farther than 1.5 m → considered clear
@@ -55,10 +51,6 @@ DEPTH_CLEAR_M = 1.50      # farther than 1.5 m → considered clear
 STRIP_LEFT = (0, FRAME_WIDTH // 3)
 STRIP_CENTER = (FRAME_WIDTH // 3, 2 * FRAME_WIDTH // 3)
 STRIP_RIGHT = (2 * FRAME_WIDTH // 3, FRAME_WIDTH)
-
-# YOLO thresholds (secondary to depth — used for labelling + dashboard)
-MIN_CONFIDENCE = 0.35
-LARGE_OBJECT_AREA = 0.04
 
 # Ultrasonic thresholds (cm)
 US_STOP = 20
@@ -79,13 +71,10 @@ MIN_STATE_DURATION = {
     "stopped": 0.3,
 }
 
-# ---------------------------------------------------------------------------
-# Exploration map
-# ---------------------------------------------------------------------------
-MAP_CELL_CM = 10
-MAP_SIZE = 100
-CM_PER_SECOND_AT_CRUISE = 15.0
-TRACK_WIDTH_CM = 16.0
+# SLAM
+PLY_EXPORT_INTERVAL = 5.0  # seconds between PLY exports
+TRACKING_LOSS_THRESHOLD = 0.15  # below this → stop (quality is 0..1)
+TRACKING_BOOTSTRAP_FRAMES = 100  # don't gate on quality during bootstrap
 
 
 # ---------------------------------------------------------------------------
@@ -99,151 +88,12 @@ class State(str, Enum):
     STOPPED = "stopped"
 
 
-class ExplorationMap:
-    """Simple 2D occupancy grid built from dead-reckoning + detections."""
-
-    def __init__(self, size: int = MAP_SIZE, cell_cm: float = MAP_CELL_CM) -> None:
-        self.size = size
-        self.cell_cm = cell_cm
-        self.grid = np.zeros((size, size), dtype=np.int8)
-        self.x = size / 2 * cell_cm
-        self.y = size / 2 * cell_cm
-        self.heading = math.pi / 2
-        self._last_update = time.monotonic()
-        self._mark(self.x, self.y, 1)
-
-    def update_pose(self, left_duty: int, right_duty: int) -> None:
-        now = time.monotonic()
-        dt = now - self._last_update
-        self._last_update = now
-        if dt <= 0 or dt > 1.0:
-            return
-        max_duty = 4095
-        left_speed = (left_duty / max_duty) * CM_PER_SECOND_AT_CRUISE * (max_duty / CRUISE_SPEED)
-        right_speed = (right_duty / max_duty) * CM_PER_SECOND_AT_CRUISE * (max_duty / CRUISE_SPEED)
-        v = (left_speed + right_speed) / 2.0
-        omega = (right_speed - left_speed) / TRACK_WIDTH_CM
-        self.heading += omega * dt
-        self.x += v * dt * math.cos(self.heading)
-        self.y += v * dt * math.sin(self.heading)
-        self._mark(self.x, self.y, 1)
-
-    def mark_obstacle_ahead(self, distance_cm: float) -> None:
-        if distance_cm <= 0 or distance_cm > 300:
-            return
-        ox = self.x + distance_cm * math.cos(self.heading)
-        oy = self.y + distance_cm * math.sin(self.heading)
-        self._mark(ox, oy, -1)
-
-    def mark_obstacle_at_angle(self, distance_cm: float, angle_offset: float) -> None:
-        if distance_cm <= 0 or distance_cm > 300:
-            return
-        heading = self.heading + angle_offset
-        ox = self.x + distance_cm * math.cos(heading)
-        oy = self.y + distance_cm * math.sin(heading)
-        self._mark(ox, oy, -1)
-
-    def _mark(self, x_cm: float, y_cm: float, value: int) -> None:
-        gx = int(x_cm / self.cell_cm)
-        gy = int(y_cm / self.cell_cm)
-        if 0 <= gx < self.size and 0 <= gy < self.size:
-            self.grid[gy, gx] = value
-
-    def to_sparse(self) -> dict:
-        visited = []
-        obstacles = []
-        for gy in range(self.size):
-            for gx in range(self.size):
-                v = self.grid[gy, gx]
-                if v == 1:
-                    visited.append([gx, gy])
-                elif v == -1:
-                    obstacles.append([gx, gy])
-        return {
-            "size": self.size,
-            "cell_cm": self.cell_cm,
-            "robot": [
-                round(self.x / self.cell_cm, 1),
-                round(self.y / self.cell_cm, 1),
-                round(math.degrees(self.heading), 1),
-            ],
-            "visited": visited,
-            "obstacles": obstacles,
-        }
-
-
-class DepthEstimator:
-    """Apple Depth Pro — metric monocular depth estimation.
-
-    Outputs a depth map in meters. No relative nonsense.
-    """
-
-    def __init__(self) -> None:
-        self._model = None
-        self._processor = None
-        self._device = None
-
-    def load(self) -> None:
-        from transformers import DepthProImageProcessorFast, DepthProForDepthEstimation
-
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self._processor = DepthProImageProcessorFast.from_pretrained("apple/DepthPro-hf")
-        self._model = DepthProForDepthEstimation.from_pretrained(
-            "apple/DepthPro-hf",
-            torch_dtype=torch.float16,
-            attn_implementation="sdpa",
-        ).to(self._device).eval()
-        log.info("Depth Pro loaded on %s (fp16 + SDPA)", self._device)
-
-    def estimate(self, img_bgr: np.ndarray) -> np.ndarray:
-        """Return depth map in meters (H×W float32, lower = closer)."""
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(img_rgb)
-
-        inputs = self._processor(images=pil_img, return_tensors="pt").to(
-            device=self._device, dtype=torch.float16
-        )
-
-        with torch.no_grad():
-            outputs = self._model(**inputs)
-
-        post = self._processor.post_process_depth_estimation(
-            outputs, target_sizes=[(img_bgr.shape[0], img_bgr.shape[1])]
-        )
-        depth_meters = post[0]["predicted_depth"].cpu().numpy().astype(np.float32)
-        return depth_meters
-
-    def get_strip_distances(self, depth_map: np.ndarray) -> tuple[float, float, float]:
-        """Get the nearest obstacle distance (meters) in left, center, right strips.
-
-        Uses the middle band of the frame (rows 30%-80%) to avoid
-        floor right in front of the camera and ceiling.
-        Returns the 10th percentile (closest stuff) per strip.
-        """
-        h = depth_map.shape[0]
-        roi = depth_map[int(h * 0.3):int(h * 0.8), :]
-
-        left = float(np.percentile(roi[:, STRIP_LEFT[0]:STRIP_LEFT[1]], 10))
-        center = float(np.percentile(roi[:, STRIP_CENTER[0]:STRIP_CENTER[1]], 10))
-        right = float(np.percentile(roi[:, STRIP_RIGHT[0]:STRIP_RIGHT[1]], 10))
-        return round(left, 2), round(center, 2), round(right, 2)
-
-    def get_center_distance(self, depth_map: np.ndarray) -> float:
-        """Nearest obstacle distance (meters) in the central region."""
-        h, w = depth_map.shape
-        roi = depth_map[int(h * 0.3):int(h * 0.8), int(w * 0.3):int(w * 0.7)]
-        return round(float(np.percentile(roi, 10)), 2)
-
-
 class VisionEngine:
-    def __init__(self, robot_url: str = "", model: str = "yolo26l.pt",
-                 debug: bool = False) -> None:
-        import os
+    def __init__(self, robot_url: str = "", debug: bool = False,
+                 splat_dir: str = "") -> None:
         robot_url = robot_url or os.environ.get("ROBOT_URL", "ws://localhost:9000")
         self._client = RobotClient(robot_url)
-        self._model_path = model
-        self._yolo = None
-        self._depth = DepthEstimator()
+        self._slam = SplatSLAM(CameraIntrinsics())
         self._latest_frame: bytes | None = None
         self._latest_telemetry: dict = {}
         self._running = False
@@ -252,18 +102,36 @@ class VisionEngine:
         self._state_since = time.monotonic()
         self._last_turn_dir: int = 1
         self._current_motor = (0, 0)
-        self._map = ExplorationMap()
-        self._map_send_counter = 0
         self._us_history: list[float] = []
+
+        # PLY export state
+        self._splat_dir = splat_dir or self._default_splat_dir()
+        self._ply_version = 0
+        self._last_ply_export = 0.0
+        self._send_counter = 0
+        self._frame_count = 0
+
+    @staticmethod
+    def _default_splat_dir() -> str:
+        """Default PLY output: Phoenix priv/static/assets/splat/."""
+        candidates = [
+            Path(__file__).resolve().parents[4] / "tankbot_web" / "priv" / "static" / "assets" / "splat",
+            Path.cwd() / "tankbot_web" / "priv" / "static" / "assets" / "splat",
+        ]
+        for p in candidates:
+            if p.parent.exists():
+                p.mkdir(parents=True, exist_ok=True)
+                return str(p)
+        # Fallback to temp
+        fallback = Path("/tmp/tankbot_splat")
+        fallback.mkdir(parents=True, exist_ok=True)
+        return str(fallback)
 
     # ------------------------------------------------------------------
     # Models
     # ------------------------------------------------------------------
     def _load_models(self) -> None:
-        from ultralytics import YOLO
-        self._yolo = YOLO(self._model_path)
-        log.info("YOLO model loaded: %s", self._model_path)
-        self._depth.load()
+        self._slam.load()
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -275,57 +143,29 @@ class VisionEngine:
         self._latest_telemetry = data
 
     # ------------------------------------------------------------------
-    # Detection + Depth
+    # SLAM analysis
     # ------------------------------------------------------------------
     def _analyse_frame(self, jpeg: bytes) -> dict:
-        """Run YOLO + Depth Pro on a frame."""
-        arr = np.frombuffer(jpeg, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            return {"detections": [], "depth_strips": (99, 99, 99), "center_dist": 99}
+        """Run SLAM on a frame — returns depth strips + pose info."""
+        result = self._slam.process_frame(jpeg, time.monotonic())
 
-        # YOLO detection
-        results = self._yolo(img, verbose=False)
-        detections = []
-        for r in results:
-            for box in r.boxes:
-                cls_id = int(box.cls[0])
-                cls_name = r.names[cls_id]
-                conf = float(box.conf[0])
-                if conf < MIN_CONFIDENCE:
-                    continue
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                area = (x2 - x1) * (y2 - y1)
-                area_ratio = area / (img.shape[0] * img.shape[1])
-                if area_ratio >= LARGE_OBJECT_AREA:
-                    detections.append({
-                        "class": cls_name,
-                        "confidence": round(conf, 2),
-                        "bbox": (round(x1), round(y1), round(x2), round(y2)),
-                        "center_x": (x1 + x2) / 2,
-                        "area_ratio": round(area_ratio, 3),
-                    })
+        if result is None:
+            # During warmup or tracking failure
+            return {
+                "detections": [],
+                "depth_strips": (99.0, 99.0, 99.0),
+                "center_dist": 99.0,
+                "slam_result": None,
+            }
 
-        # Depth Pro — metric depth in meters
-        depth_map = self._depth.estimate(img)
-
-        # Enrich detections with real distance in meters
-        for det in detections:
-            x1, y1, x2, y2 = det["bbox"]
-            roi = depth_map[y1:y2, x1:x2]
-            if roi.size > 0:
-                det["distance_m"] = round(float(np.percentile(roi, 10)), 2)
-            else:
-                det["distance_m"] = 99.0
-
-        # Strip distances for steering
-        strip_l, strip_c, strip_r = self._depth.get_strip_distances(depth_map)
-        center_dist = self._depth.get_center_distance(depth_map)
+        strip_l, strip_c, strip_r = self._slam.get_strip_distances(result.depth_map)
+        center_dist = self._slam.get_center_distance(result.depth_map)
 
         return {
-            "detections": detections,
+            "detections": [],
             "depth_strips": (strip_l, strip_c, strip_r),
             "center_dist": center_dist,
+            "slam_result": result,
         }
 
     # ------------------------------------------------------------------
@@ -360,65 +200,49 @@ class VisionEngine:
             return float("inf")
         return min(self._us_history)
 
-    def _update_map(self, detections: list[dict], us_distance: float,
-                    depth_strips: tuple[float, float, float]) -> None:
-        self._map.update_pose(*self._current_motor)
+    def _maybe_export_ply(self) -> None:
+        """Export PLY if enough time has passed since last export."""
+        now = time.monotonic()
+        if now - self._last_ply_export < PLY_EXPORT_INTERVAL:
+            return
+        ply_path = os.path.join(self._splat_dir, "scene.ply")
+        if self._slam.export_ply(ply_path):
+            self._ply_version += 1
+            self._last_ply_export = now
+            log.info("PLY v%d exported (%d Gaussians)", self._ply_version, self._slam.num_gaussians)
 
-        if 0 < us_distance < 200:
-            self._map.mark_obstacle_ahead(us_distance)
+    async def _send_vision_status(self, us_distance: float,
+                                  depth_strips: tuple[float, float, float],
+                                  slam_result) -> None:
+        self._send_counter += 1
 
-        for det in detections:
-            cx = det["center_x"]
-            angle_offset = ((cx - FRAME_WIDTH / 2) / FRAME_WIDTH) * 1.05
-            dist_cm = det.get("distance_m", 99) * 100
-            self._map.mark_obstacle_at_angle(dist_cm, -angle_offset)
-
-        # Mark obstacles from depth strips
-        for dist_m, angle in [
-            (depth_strips[0], 0.4),
-            (depth_strips[1], 0.0),
-            (depth_strips[2], -0.4),
-        ]:
-            if dist_m < DEPTH_SLOW_M:
-                self._map.mark_obstacle_at_angle(dist_m * 100, angle)
-
-    async def _send_vision_status(self, detections: list[dict], us_distance: float,
-                                  depth_strips: tuple[float, float, float]) -> None:
-        self._map_send_counter += 1
-        map_data = None
-        if self._map_send_counter >= 5:
-            self._map_send_counter = 0
-            map_data = self._map.to_sparse()
+        # Build SLAM telemetry (sent every update)
+        slam_data = None
+        if slam_result is not None:
+            slam_data = {
+                "tracking_quality": slam_result.tracking_quality,
+                "num_gaussians": slam_result.num_gaussians,
+                "camera_pose": slam_result.camera_pose.flatten().tolist(),
+                "ply_version": self._ply_version,
+            }
 
         await self._client.send_vision_status(
             state=self._state.value,
-            detections=[
-                {
-                    "class": d["class"],
-                    "confidence": d["confidence"],
-                    "area": d["area_ratio"],
-                    "depth": d.get("distance_m", 99),
-                    "x1": round(d["bbox"][0] / FRAME_WIDTH * 100, 1),
-                    "y1": round(d["bbox"][1] / FRAME_HEIGHT * 100, 1),
-                    "x2": round(d["bbox"][2] / FRAME_WIDTH * 100, 1),
-                    "y2": round(d["bbox"][3] / FRAME_HEIGHT * 100, 1),
-                }
-                for d in detections
-            ],
+            detections=[],
             distance=us_distance,
             depth_strips=depth_strips,
-            map_data=map_data,
+            slam_data=slam_data,
         )
 
     # ------------------------------------------------------------------
     # Decision loop
     # ------------------------------------------------------------------
     async def _decision_loop(self) -> None:
-        """Main autonomy loop: detect → estimate depth → decide → act.
+        """Main autonomy loop: SLAM → depth → decide → act.
 
         Philosophy: always head toward the most free space.  The robot
-        treats the depth map as a "clearance field" and steers toward
-        whichever direction has the most room.  Speed is proportional
+        treats the SLAM-rendered depth map as a "clearance field" and steers
+        toward whichever direction has the most room.  Speed is proportional
         to the distance ahead — lots of room = cruise, tight = creep.
         """
         while self._running:
@@ -431,20 +255,42 @@ class VisionEngine:
             loop = asyncio.get_running_loop()
             analysis = await loop.run_in_executor(None, self._analyse_frame, frame)
 
-            detections = analysis["detections"]
             depth_strips = analysis["depth_strips"]
             center_dist = analysis["center_dist"]
+            slam_result = analysis["slam_result"]
             strip_l, strip_c, strip_r = depth_strips
+            self._frame_count += 1
 
             raw_us = self._latest_telemetry.get("distance", -1)
             us_distance = self._filter_distance(raw_us)
 
-            self._update_map(
-                detections,
-                us_distance if us_distance != float("inf") else -1,
-                depth_strips,
-            )
-            await self._send_vision_status(detections, us_distance, depth_strips)
+            # Export PLY periodically (in executor since it touches disk)
+            if slam_result is not None:
+                await loop.run_in_executor(None, self._maybe_export_ply)
+
+            await self._send_vision_status(us_distance, depth_strips, slam_result)
+
+            # During warmup (no depth yet), stay still
+            if slam_result is None:
+                self._set_state(State.SCANNING)
+                if not self._debug:
+                    await self._stop()
+                await asyncio.sleep(0.1)
+                continue
+
+            # After bootstrap period, gate on tracking quality
+            bootstrapping = self._frame_count < TRACKING_BOOTSTRAP_FRAMES
+            if not bootstrapping and slam_result.tracking_quality < TRACKING_LOSS_THRESHOLD:
+                self._set_state(State.STOPPED)
+                if self._send_counter % 30 == 0:
+                    log.warning(
+                        "Tracking quality low (%.2f), gaussians=%d, stopping",
+                        slam_result.tracking_quality, slam_result.num_gaussians,
+                    )
+                if not self._debug:
+                    await self._stop()
+                await asyncio.sleep(0.1)
+                continue
 
             # The most free space in any direction
             best_strip = max(strip_l, strip_c, strip_r)
@@ -453,10 +299,11 @@ class VisionEngine:
 
             if self._debug:
                 log.info(
-                    "depth L=%.2fm C=%.2fm R=%.2fm | center=%.2fm | US=%.1fcm | objects=%d",
+                    "depth L=%.2fm C=%.2fm R=%.2fm | center=%.2fm | US=%.1fcm | gaussians=%d | quality=%.2f",
                     strip_l, strip_c, strip_r, center_dist,
                     us_distance if us_distance != float("inf") else -1,
-                    len(detections),
+                    slam_result.num_gaussians,
+                    slam_result.tracking_quality,
                 )
                 if worst_strip < DEPTH_STOP_M or (0 < us_distance < US_STOP):
                     self._set_state(State.BACKING_UP)
@@ -503,38 +350,21 @@ class VisionEngine:
                 continue
 
             # === TIER 3: Navigate toward the most free space ===
-            #
-            # Speed: proportional to how much room is ahead (center).
-            # Steering: bias toward the strip with the most distance.
-            #
-            # This means the robot naturally flows into open areas
-            # and gently curves away from walls — no hard "avoid" mode.
-
-            # Speed: scale between MIN_DUTY and CRUISE_SPEED based on
-            # center clearance.  At DEPTH_STOP_M → MIN_DUTY, at
-            # DEPTH_CLEAR_M or more → CRUISE_SPEED.
             clearance = max(0.0, min(1.0,
                 (center_dist - DEPTH_STOP_M) / (DEPTH_CLEAR_M - DEPTH_STOP_M)
             ))
             base_speed = int(MIN_DUTY + (CRUISE_SPEED - MIN_DUTY) * clearance)
 
-            # Steering: compute a bias from -1 (turn left) to +1 (turn right)
-            # based on where the most space is.
             total = strip_l + strip_c + strip_r
             if total > 0.01:
-                # Weighted: right pulls positive, left pulls negative
                 bias = (strip_r - strip_l) / total
             else:
                 bias = 0.0
 
-            # Convert bias to differential drive.
-            # bias=0 → straight, bias=+1 → hard right, bias=-1 → hard left
-            # We scale the steering strength by how different the sides are.
-            steer = bias * 0.5  # 0..0.5 range, keeps it smooth
+            steer = bias * 0.5
             left_speed = int(base_speed * (1 + steer))
             right_speed = int(base_speed * (1 - steer))
 
-            # Clamp
             left_speed = max(MIN_DUTY, min(left_speed, CRUISE_SPEED))
             right_speed = max(MIN_DUTY, min(right_speed, CRUISE_SPEED))
 
@@ -560,7 +390,7 @@ class VisionEngine:
         if self._debug:
             log.info("Vision engine running — DEBUG MODE (no motor commands)")
         else:
-            log.info("Vision engine running — cautious autonomous mode active")
+            log.info("Vision engine running — 3DGS SLAM autonomous mode active")
 
         try:
             await asyncio.gather(
@@ -584,14 +414,14 @@ def main() -> None:
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    parser = argparse.ArgumentParser(description="Tank robot autonomous vision")
+    parser = argparse.ArgumentParser(description="Tank robot autonomous vision (3DGS SLAM)")
     parser.add_argument("--robot", default="", help="Robot WebSocket URL (or set ROBOT_URL env var)")
-    parser.add_argument("--model", default="yolo26l.pt", help="YOLO model path")
+    parser.add_argument("--splat-dir", default="", help="Directory for PLY export (default: Phoenix static assets)")
     parser.add_argument("--debug", action="store_true",
-                        help="Debug mode: run detection + depth but send no motor commands")
+                        help="Debug mode: run SLAM but send no motor commands")
     args = parser.parse_args()
 
-    engine = VisionEngine(robot_url=args.robot, model=args.model, debug=args.debug)
+    engine = VisionEngine(robot_url=args.robot, debug=args.debug, splat_dir=args.splat_dir)
     asyncio.run(engine.run())
 
 

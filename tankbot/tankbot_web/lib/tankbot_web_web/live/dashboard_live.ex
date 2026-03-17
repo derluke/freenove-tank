@@ -24,13 +24,19 @@ defmodule TankbotWebWeb.DashboardLive do
        vision_last_seen: nil,
        depth_left: 0.0,
        depth_center: 0.0,
-       depth_right: 0.0
+       depth_right: 0.0,
+       # SLAM state
+       slam_tracking_quality: 0.0,
+       slam_num_gaussians: 0,
+       slam_ply_version: 0
      )}
   end
 
   @impl true
   def handle_info({:telemetry, %{"type" => "vision"} = data}, socket) do
     depth = data["depth"] || %{}
+    slam = data["slam"] || %{}
+
     socket =
       assign(socket,
         vision_active: true,
@@ -39,14 +45,25 @@ defmodule TankbotWebWeb.DashboardLive do
         vision_last_seen: System.monotonic_time(:second),
         depth_left: depth["left"] || 0.0,
         depth_center: depth["center"] || 0.0,
-        depth_right: depth["right"] || 0.0
+        depth_right: depth["right"] || 0.0,
+        slam_tracking_quality: slam["tracking_quality"] || 0.0,
+        slam_num_gaussians: slam["num_gaussians"] || 0,
+        slam_ply_version: slam["ply_version"] || socket.assigns.slam_ply_version
       )
 
-    # Push map data to the JS hook when present
+    # Push SLAM splat update to the JS 3D viewer hook
     socket =
-      case data["map"] do
-        nil -> socket
-        map_data -> push_event(socket, "map_update", map_data)
+      case slam["ply_version"] do
+        nil ->
+          socket
+
+        ply_version ->
+          push_event(socket, "splat_update", %{
+            ply_version: ply_version,
+            camera_pose: slam["camera_pose"],
+            tracking_quality: slam["tracking_quality"] || 0.0,
+            num_gaussians: slam["num_gaussians"] || 0
+          })
       end
 
     {:noreply, socket}
@@ -265,27 +282,20 @@ defmodule TankbotWebWeb.DashboardLive do
                   </div>
                 <% end %>
               </div>
-              <%!-- Exploration minimap --%>
+              <%!-- 3D Gaussian Splat Map --%>
               <div class="mt-4">
-                <h3 class="text-sm font-semibold text-gray-400 mb-2">Exploration Map</h3>
-                <canvas
-                  id="exploration-map"
-                  phx-hook="ExplorationMap"
-                  width="300"
-                  height="300"
+                <h3 class="text-sm font-semibold text-gray-400 mb-2">3D Map</h3>
+                <div
+                  id="splat-viewer"
+                  phx-hook="SplatViewer"
+                  phx-update="ignore"
                   class="w-full rounded border border-gray-700"
-                  style="image-rendering: pixelated; aspect-ratio: 1;"
-                ></canvas>
+                  style="height: 400px;"
+                ></div>
                 <div class="flex gap-4 mt-2 text-xs text-gray-500">
-                  <span class="flex items-center gap-1">
-                    <span class="inline-block w-3 h-3 rounded-sm bg-green-500/40"></span> Visited
-                  </span>
-                  <span class="flex items-center gap-1">
-                    <span class="inline-block w-3 h-3 rounded-sm bg-red-500/80"></span> Obstacle
-                  </span>
-                  <span class="flex items-center gap-1">
-                    <span class="inline-block w-3 h-3 rounded-sm bg-blue-400"></span> Robot
-                  </span>
+                  <span>Gaussians: <span class="font-mono"><%= @slam_num_gaussians %></span></span>
+                  <span>Tracking: <span class="font-mono"><%= if @slam_tracking_quality > 0, do: "#{round(@slam_tracking_quality * 100)}%", else: "\u2014" %></span></span>
+                  <span>PLY: <span class="font-mono">v<%= @slam_ply_version %></span></span>
                 </div>
               </div>
             </div>

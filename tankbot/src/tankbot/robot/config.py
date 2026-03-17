@@ -25,7 +25,7 @@ class RobotConfig:
     cmd_port: int = 5003
     video_port: int = 8003
     ws_port: int = 9000
-    stream_size: tuple[int, int] = (400, 300)
+    stream_size: tuple[int, int] = (640, 480)
 
     @staticmethod
     def load(path: Path = _PARAMS_FILE) -> RobotConfig:

@@ -135,8 +135,8 @@ class Robot:
             }
             if "depth" in msg:
                 self.vision_status["depth"] = msg["depth"]
-            if "map" in msg:
-                self.vision_status["map"] = msg["map"]
+            if "slam" in msg:
+                self.vision_status["slam"] = msg["slam"]
             if self.ws_api.has_clients:
                 await self.ws_api.broadcast_telemetry(self.vision_status)
         elif cmd_type == "arm":

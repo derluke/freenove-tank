@@ -1,5 +1,6 @@
 {
   "dependencies": {
-    "blockly": "^12.4.1"
+    "blockly": "^12.4.1",
+    "three": "^0.183.2"
   }
 }

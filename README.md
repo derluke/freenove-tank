@@ -6,92 +6,174 @@ Replaces the original PyQt5 desktop app with a three-part architecture:
 
 | Component | Runs on | Language | Purpose |
 |-----------|---------|----------|---------|
-| **Robot server** | Raspberry Pi | Python 3.11 (asyncio) | Hardware drivers, protocol servers |
+| **Robot server** | Raspberry Pi 5 | Python 3.11 (asyncio) | Hardware drivers, protocol servers |
 | **Web dashboard** | Desktop / any device | Elixir (Phoenix LiveView) | Real-time control UI, Blockly programming |
-| **Vision engine** | Desktop GPU | Python (YOLOv11) | Autonomous obstacle avoidance |
+| **Vision engine** | Desktop GPU | Python (YOLO26 + Depth Pro) | Autonomous navigation with metric depth |
 
-## Quick start
+## Prerequisites
 
-### Prerequisites
+### Hardware
 
-- Raspberry Pi 5 with the Freenove tank kit assembled (PCB v2.0)
-- Desktop machine on the same network
-- [Task](https://taskfile.dev) runner, [uv](https://docs.astral.sh/uv/) (Python), [Elixir](https://elixir-lang.org/install.html) + [Node.js](https://nodejs.org/)
+- **Freenove Tank Robot Kit** assembled on a **Raspberry Pi 5** (PCB v2.0)
+- **Desktop/laptop** with an **NVIDIA GPU** (for the vision engine — any modern GPU with 4GB+ VRAM works, the models use ~2GB total)
+- Both machines on the **same local network** (Wi-Fi or Ethernet)
 
-### Configuration
+### Raspberry Pi setup
+
+1. Flash **Raspberry Pi OS (Bookworm, 64-bit)** onto the Pi
+2. Enable **SSH** and **camera** in `raspi-config`
+3. Set up **SSH key access** from your desktop so you can `ssh pi@<pi-ip>` without a password:
+   ```bash
+   ssh-copy-id <your-pi-user>@<your-pi-ip>
+   ```
+4. Note the Pi's IP address (`hostname -I` on the Pi) — you'll need it for the `.env` file
+
+### Desktop setup
+
+Install these tools:
+
+| Tool | What for | Install |
+|------|----------|---------|
+| [Task](https://taskfile.dev) | Build/deploy runner | `brew install go-task` or see [install docs](https://taskfile.dev/installation/) |
+| [uv](https://docs.astral.sh/uv/) | Python package manager | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| [Elixir](https://elixir-lang.org/install.html) | Phoenix web framework | `brew install elixir` or see install docs |
+| [Node.js](https://nodejs.org/) | Phoenix asset pipeline | `brew install node` or use your distro's package |
+| NVIDIA drivers + CUDA | GPU inference | See [NVIDIA docs](https://developer.nvidia.com/cuda-downloads) |
+
+## Getting started
+
+All commands run from the `tankbot/` directory.
+
+### 1. Configure
 
 ```bash
 cd tankbot
 cp .env.example .env
-# Edit .env with your Pi's IP, username, and deploy path
 ```
 
-| Variable | Default | Used by |
-|----------|---------|---------|
-| `PI_HOST` | `raspberrypi.local` | Taskfile (SSH/rsync) |
-| `PI_USER` | `pi` | Taskfile (SSH/rsync) |
-| `PI_DIR` | `/home/pi/tankbot` | Taskfile (deploy path) |
-| `ROBOT_URL` | `ws://localhost:9000` | Phoenix web app, vision engine |
+Edit `.env` with your Pi's details:
 
-### First-time setup
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PI_HOST` | `raspberrypi.local` | Pi hostname or IP address |
+| `PI_USER` | `pi` | SSH username on the Pi |
+| `PI_DIR` | `/home/pi/tankbot` | Where code gets deployed on the Pi |
+| `ROBOT_URL` | `ws://localhost:9000` | Robot WebSocket URL (Phoenix and vision use this) |
+
+### 2. First-time setup
 
 ```bash
-task setup        # installs uv on Pi, deploys code, installs Phoenix deps, installs vision deps
+task setup
 ```
 
-### Running
+This single command:
+- Installs `uv` on the Pi
+- Deploys code to the Pi and installs Python dependencies
+- Installs Phoenix (Elixir) dependencies and builds JS assets
+- Installs vision engine dependencies (PyTorch, YOLO26, Depth Pro, etc.)
 
-Open three terminals:
+**First run will download model weights** (~400MB for Depth Pro, ~50MB for YOLO26l). This only happens once.
+
+### 3. Running
+
+Open **three terminals**:
 
 ```bash
-# Terminal 1 — Robot server on Pi
+# Terminal 1 — Robot server (runs on the Pi via SSH)
 task pi:start
 
-# Terminal 2 — Web dashboard on desktop
-task web:start        # → http://localhost:4000
+# Terminal 2 — Web dashboard (runs locally)
+task web:start
+# → open http://localhost:4000
 
-# Terminal 3 — (optional) Vision autonomy
-task vision:start
+# Terminal 3 — Vision engine (runs locally, uses your GPU)
+task vision:start          # autonomous mode
+# OR
+task vision:debug          # debug mode — see what AI sees while driving manually
 ```
 
-### Day-to-day development
+You should see:
+- **Camera feed** in the dashboard with live YOLO bounding boxes (class + distance in meters)
+- **Depth proximity bars** (L/C/R) showing nearest obstacle distance in each direction
+- **Exploration minimap** tracking where the robot has been and where obstacles are
+- **Vision state badge** showing what the robot is doing (Cruising / Avoiding / Backing up)
+
+### 4. Day-to-day development
 
 ```bash
-task dev              # sync code to Pi + restart robot server
+task dev                   # sync code to Pi + restart robot server
+task pi:restart            # full redeploy + restart
 ```
+
+## How it works
+
+### Vision engine
+
+The vision engine runs on your desktop GPU and processes the robot's camera feed in real-time:
+
+1. **YOLO26l** detects and classifies objects (people, chairs, etc.)
+2. **Apple Depth Pro** estimates metric depth for every pixel — outputting real distances in meters
+3. The frame is split into three vertical strips (left/center/right) and the **nearest obstacle distance** in each strip is computed
+4. The robot **steers toward the most open space** — speed scales with clearance, steering biases toward whichever direction has the most room
+5. An **exploration map** tracks visited areas and obstacle locations via dead-reckoning
+
+The vision engine sends all detection and depth data to the robot, which relays it to the web dashboard for visualization.
+
+### Debug mode
+
+`task vision:debug` runs the full vision pipeline (YOLO + Depth Pro) but sends **no motor commands**. You drive manually via WASD while watching:
+
+- Bounding boxes with object class, confidence, and distance
+- Depth proximity bars showing meters to nearest obstacle in each strip
+- What state the robot *would* be in (backing up / avoiding / cruising)
+- Exploration map building as you drive
+
+This is invaluable for tuning thresholds and understanding what the models see before enabling autonomous driving.
+
+### Dashboard
+
+The web dashboard at `http://localhost:4000` provides:
+
+- **Live camera feed** with YOLO bounding box overlays
+- **WASD keyboard controls** for manual driving (hold keys for continuous movement)
+- **Arm/grabber controls** (R/F for arm, T/G for grabber)
+- **Sensor telemetry** — ultrasonic distance, IR sensors, motor speeds
+- **Vision autonomy panel** — state indicator, depth bars, detected objects, exploration minimap
+- **Mode selector** — Manual, Sonar avoidance, Line following
+- **Block programming** — visual programming with Google Blockly at `/blocks`
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Browser (any device)                               │
-│  ┌───────────────┐  ┌────────────────────────────┐  │
-│  │  Dashboard     │  │  Block Programming         │  │
-│  │  WASD drive    │  │  Blockly → JS code gen     │  │
-│  │  Arm/grabber   │  │  Save/load programs        │  │
-│  │  Camera feed   │  │  Async robot API           │  │
-│  │  Telemetry     │  │  Client-side execution     │  │
-│  └───────┬───────┘  └──────────┬─────────────────┘  │
-│          │ LiveView            │ LiveView             │
-└──────────┼─────────────────────┼─────────────────────┘
-           ▼                     ▼
-┌──────────────────────────────────────┐
-│  Phoenix (Elixir)                    │
-│  WebSocket bridge to robot           │
-│  PubSub: telemetry + video frames    │
-└──────────────────┬───────────────────┘
-                   │ WebSocket :9000
-                   ▼
-┌──────────────────────────────────────┐     ┌────────────────────┐
-│  Robot server (Python, asyncio)      │◄────│  Vision engine     │
-│  ┌──────────┐ ┌────────────────────┐ │     │  YOLOv11 nano      │
-│  │ Legacy   │ │ WebSocket API      │ │     │  Desktop GPU       │
-│  │ TCP:5003 │ │ JSON + binary      │ │     │  ~10 Hz decisions  │
-│  │ TCP:8003 │ │ video frames       │ │     └────────────────────┘
-│  └──────────┘ └────────────────────┘ │
-│  Drivers: motor, servo, camera,      │
-│  ultrasonic, infrared, LED strip     │
-└──────────────────────────────────────┘
++---------------------------------------------------------+
+|  Browser (any device)                                   |
+|  +----------------+  +------------------------------+   |
+|  |  Dashboard     |  |  Block Programming           |   |
+|  |  WASD drive    |  |  Blockly visual editor       |   |
+|  |  Camera + YOLO |  |  Save/load programs          |   |
+|  |  Depth bars    |  |  Client-side JS execution    |   |
+|  |  Minimap       |  |                              |   |
+|  +-------+--------+  +-------------+----------------+   |
+|          | LiveView                 | LiveView           |
++----------+--------------------------+-------------------+
+           v                          v
++----------------------------------------------+
+|  Phoenix (Elixir)                            |
+|  WebSocket bridge to robot                   |
+|  PubSub: telemetry + video + vision overlays |
++---------------------+------------------------+
+                      | WebSocket :9000
+                      v
++----------------------------------------------+    +---------------------------+
+|  Robot server (Python, asyncio)              |<---|  Vision engine (desktop)  |
+|  +----------+ +----------------------------+ |    |  YOLO26l detection        |
+|  | Legacy   | | WebSocket API              | |    |  Depth Pro metric depth   |
+|  | TCP:5003 | | JSON + binary JPEG         | |    |  Exploration mapping      |
+|  | TCP:8003 | | Vision telemetry relay     | |    |  ~3 Hz (detection+depth)  |
+|  +----------+ +----------------------------+ |    +---------------------------+
+|  Drivers: motor, servo, camera, ultrasonic,  |
+|  infrared, LED strip                         |
++----------------------------------------------+
 ```
 
 ### Communication protocols
@@ -108,7 +190,6 @@ The legacy TCP protocol is maintained for backwards compatibility with the offic
 
 ### Dashboard (http://localhost:4000)
 
-**Keyboard:**
 | Key | Action |
 |-----|--------|
 | W / Arrow Up | Drive forward |
@@ -123,8 +204,6 @@ The legacy TCP protocol is maintained for backwards compatibility with the offic
 
 All drive keys are additive (W+D = forward-right). Servo keys auto-repeat while held.
 
-**Buttons:** Click or hold — hold-to-repeat at 120ms for continuous servo movement.
-
 ### Block programming (http://localhost:4000/blocks)
 
 Visual programming with Google Blockly. Custom robot blocks:
@@ -135,9 +214,7 @@ Visual programming with Google Blockly. Custom robot blocks:
 - **Timing**: wait N seconds
 - **Logging**: print to log panel
 
-Plus standard Blockly blocks: if/else, loops, variables, math, text.
-
-Programs are saved to browser localStorage. Auto-saves every 2 seconds.
+Programs are saved to browser localStorage and auto-save every 2 seconds.
 
 ## Hardware
 
@@ -145,23 +222,25 @@ Programs are saved to browser localStorage. Auto-saves every 2 seconds.
 
 | Channel | GPIO | Function | Range | Default |
 |---------|------|----------|-------|---------|
-| 0 | 7 | Grabber | 90° (open) – 140° (closed) | 130° |
-| 1 | 8 | Arm | 75° (down) – 150° (up) | 140° |
-| 2 | 25 | Camera tilt | 0° – 180° | — |
+| 0 | 7 | Grabber | 90 (open) - 140 (closed) | 130 |
+| 1 | 8 | Arm | 75 (down) - 150 (up) | 140 |
+| 2 | 25 | Camera tilt | 0 - 180 | -- |
+
+### Sensors
+
+| Sensor | Type | Pins | Notes |
+|--------|------|------|-------|
+| Ultrasonic | HC-SR04 | GPIO 27 (trigger), 22 (echo) | Fixed forward-facing, max ~2m, unreliable on soft surfaces |
+| Infrared | 3x line sensor | GPIO 16, 26, 21 | Returns 3-bit value (0-7) for line following |
+| Camera | Picamera2 | CSI | 400x300 JPEG stream, hflip + vflip |
 
 ### Motor ramping
 
-Motors ramp at 400 duty/step (50 Hz) to prevent power spikes that cause Pi undervoltage. Emergency stop bypasses ramping.
-
-### Servo sweeping
-
-Servos move at 3°/step (50 Hz) for smooth motion. On shutdown, servos hold position (no release) to prevent the arm from dropping.
+Motors ramp at 400 duty/step at 50 Hz to prevent power spikes. Tank treads need a minimum duty of ~1000 to overcome friction. Emergency stop bypasses ramping.
 
 ### PCB versions
 
-This project defaults to **PCB v2.0** with hardware PWM servos and SPI LEDs. PCB v1.0 (gpiozero servos, GPIO LEDs) is also supported — set `Pcb_Version` in `params.json` on the Pi.
-
-See [legacy/README.md](legacy/) for the original Freenove GPIO pinout table.
+This project defaults to **PCB v2.0** with hardware PWM servos and SPI LEDs. PCB v1.0 (gpiozero servos, GPIO LEDs) is also supported.
 
 ## Project structure
 
@@ -177,24 +256,24 @@ tankbot/
 │   │   ├── drivers/                  motor, servo, camera, ultrasonic, infrared, LED
 │   │   └── protocol/                 legacy_tcp.py, websocket_api.py
 │   └── desktop/autonomy/
-│       ├── vision.py                 YOLOv11 autonomous navigation
-│       └── robot_client.py           WebSocket client for vision
+│       ├── vision.py                 YOLO26 + Depth Pro autonomous navigation
+│       └── robot_client.py           WebSocket client for vision engine
 ├── tankbot_web/
 │   ├── mix.exs                       Elixir deps (Phoenix, LiveView)
 │   ├── lib/tankbot_web/
-│   │   ├── robot_socket.ex           WebSocket bridge to Python
+│   │   ├── robot_socket.ex           WebSocket bridge to Python robot
 │   │   └── ...
 │   ├── lib/tankbot_web_web/live/
-│   │   ├── dashboard_live.ex         Main control UI
+│   │   ├── dashboard_live.ex         Main control UI + vision overlays
 │   │   └── blocks_live.ex            Blockly visual programming
 │   └── assets/js/hooks/
 │       ├── drive_hook.js             WASD + hold-to-repeat controls
-│       └── blockly_hook.js           Blockly workspace + code gen
+│       ├── blockly_hook.js           Blockly workspace + code gen
+│       └── map_hook.js               Exploration minimap canvas
 └── ...
 
 legacy/                               Original Freenove codebase (reference)
 ├── Code/                             PyQt5 server + client
-├── Application/                      Pre-built desktop clients
 ├── Tutorial.pdf                      Assembly & wiring guide
 └── ...
 ```
@@ -203,31 +282,57 @@ legacy/                               Original Freenove codebase (reference)
 
 ```bash
 # Deployment
-task pi:sync          # rsync code to Pi
-task pi:deploy        # sync + install deps
-task pi:start         # start robot server (SSH)
-task pi:stop          # stop robot server
-task pi:restart       # stop + deploy + start
-task pi:ssh           # open SSH session
+task pi:sync              # rsync code to Pi
+task pi:deploy            # sync + install deps
+task pi:start             # start robot server (SSH)
+task pi:stop              # stop robot server
+task pi:restart           # stop + deploy + start
+task pi:ssh               # open SSH session
 
 # Web dashboard
-task web:setup        # install deps + build assets
-task web:start        # start Phoenix dev server
+task web:setup            # install deps + build assets
+task web:start            # start Phoenix dev server
 
 # Vision
-task vision:setup     # install YOLO + torch
-task vision:start     # start autonomous vision
+task vision:setup         # install YOLO + Depth Pro + torch
+task vision:start         # start autonomous vision
+task vision:debug         # debug mode — AI overlays, manual driving
 
 # Quality
-task lint             # ruff linter
-task typecheck        # mypy strict
-task check            # all checks
+task lint                 # ruff linter
+task lint:fix             # ruff linter with auto-fix
+task format               # ruff formatter
+task typecheck            # mypy strict
+task check                # all checks
 
 # Workflows
-task setup            # first-time setup (everything)
-task dev              # quick iteration (sync + restart Pi)
-task up               # deploy + start robot
+task setup                # first-time setup (everything)
+task dev                  # quick iteration (sync + restart Pi)
+task up                   # deploy + start robot
 ```
+
+## Troubleshooting
+
+**Robot server won't start (`ModuleNotFoundError: No module named 'tankbot'`)**
+The editable install on the Pi may be broken. SSH in and run:
+```bash
+cd /home/<user>/tankbot && ~/.local/bin/uv pip install -e '.[robot]'
+```
+
+**Vision engine can't connect to robot**
+Make sure `ROBOT_URL` in `.env` points to the Pi's IP, not `localhost`:
+```
+ROBOT_URL=ws://192.168.x.x:9000
+```
+
+**Motors whine but don't move**
+The tank treads need high duty values to overcome friction. If you've changed speed constants, ensure nothing goes below 1000.
+
+**Ultrasonic shows huge distances when close to something**
+The HC-SR04 is unreliable on soft surfaces (blankets, cushions). The vision engine filters these readings and relies on Depth Pro as the primary depth sensor.
+
+**Depth Pro downloads on first run**
+Model weights (~400MB) are downloaded from HuggingFace on first launch. This only happens once and is cached locally.
 
 ## License
 

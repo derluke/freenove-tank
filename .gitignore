@@ -17,4 +17,7 @@ node_modules/
 .idea/
 .vscode/
 *.swp
+
+# Models / Vendor
 tankbot/*.pt
+tankbot/vendor/
