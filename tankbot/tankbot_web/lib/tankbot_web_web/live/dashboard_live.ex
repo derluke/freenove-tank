@@ -27,8 +27,11 @@ defmodule TankbotWebWeb.DashboardLive do
        depth_right: 0.0,
        # SLAM state
        slam_tracking_quality: 0.0,
-       slam_num_gaussians: 0,
-       slam_ply_version: 0
+       slam_num_points: 0,
+       slam_ply_version: 0,
+       autonomy_goal: nil,
+       autonomy_behavior: nil,
+       autonomy_phase: nil
      )}
   end
 
@@ -36,6 +39,7 @@ defmodule TankbotWebWeb.DashboardLive do
   def handle_info({:telemetry, %{"type" => "vision"} = data}, socket) do
     depth = data["depth"] || %{}
     slam = data["slam"] || %{}
+    autonomy = data["autonomy"] || %{}
 
     socket =
       assign(socket,
@@ -47,8 +51,11 @@ defmodule TankbotWebWeb.DashboardLive do
         depth_center: depth["center"] || 0.0,
         depth_right: depth["right"] || 0.0,
         slam_tracking_quality: slam["tracking_quality"] || 0.0,
-        slam_num_gaussians: slam["num_gaussians"] || 0,
-        slam_ply_version: slam["ply_version"] || socket.assigns.slam_ply_version
+        slam_num_points: slam["num_points"] || slam["num_gaussians"] || 0,
+        slam_ply_version: slam["ply_version"] || socket.assigns.slam_ply_version,
+        autonomy_goal: autonomy["goal"] || socket.assigns.autonomy_goal,
+        autonomy_behavior: autonomy["behavior"] || socket.assigns.autonomy_behavior,
+        autonomy_phase: autonomy["phase"] || socket.assigns.autonomy_phase
       )
 
     # Push camera pose to JS hook every frame (for robot marker)
@@ -56,14 +63,21 @@ defmodule TankbotWebWeb.DashboardLive do
     socket =
       case slam["camera_pose"] do
         nil ->
-          socket
+          push_event(socket, "splat_update", %{
+            ply_version: slam["ply_version"] || socket.assigns.slam_ply_version,
+            camera_pose: nil,
+            pose_valid: false,
+            tracking_quality: slam["tracking_quality"] || 0.0,
+            num_points: slam["num_points"] || slam["num_gaussians"] || 0
+          })
 
         camera_pose ->
           push_event(socket, "splat_update", %{
             ply_version: slam["ply_version"] || socket.assigns.slam_ply_version,
             camera_pose: camera_pose,
+            pose_valid: slam["pose_valid"] != false,
             tracking_quality: slam["tracking_quality"] || 0.0,
-            num_gaussians: slam["num_gaussians"] || 0
+            num_points: slam["num_points"] || slam["num_gaussians"] || 0
           })
       end
 
@@ -283,7 +297,7 @@ defmodule TankbotWebWeb.DashboardLive do
                   </div>
                 <% end %>
               </div>
-              <%!-- 3D Gaussian Splat Map --%>
+              <%!-- Exported Point-Cloud Map --%>
               <div class="mt-4">
                 <h3 class="text-sm font-semibold text-gray-400 mb-2">3D Map</h3>
                 <div
@@ -294,9 +308,14 @@ defmodule TankbotWebWeb.DashboardLive do
                   style="height: 400px;"
                 ></div>
                 <div class="flex gap-4 mt-2 text-xs text-gray-500">
-                  <span>Gaussians: <span class="font-mono"><%= @slam_num_gaussians %></span></span>
+                  <span>Points: <span class="font-mono"><%= @slam_num_points %></span></span>
                   <span>Tracking: <span class="font-mono"><%= if @slam_tracking_quality > 0, do: "#{round(@slam_tracking_quality * 100)}%", else: "\u2014" %></span></span>
                   <span>PLY: <span class="font-mono">v<%= @slam_ply_version %></span></span>
+                </div>
+                <div class="flex gap-4 mt-2 text-xs text-gray-500">
+                  <span>Goal: <span class="font-mono"><%= @autonomy_goal || "\u2014" %></span></span>
+                  <span>Behavior: <span class="font-mono"><%= @autonomy_behavior || "\u2014" %></span></span>
+                  <span>Phase: <span class="font-mono"><%= @autonomy_phase || "\u2014" %></span></span>
                 </div>
               </div>
             </div>

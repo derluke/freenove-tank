@@ -35,6 +35,12 @@ log = logging.getLogger(__name__)
 FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 
+# Robot-specific pose plausibility diagnostics. This is not part of upstream
+# MASt3R-SLAM; it helps flag obviously bad tracking updates without directly
+# suppressing mapping/keyframe creation.
+MAX_TRACK_TRANSLATION_STEP_M = 0.40
+MAX_TRACK_ROTATION_STEP_DEG = 45.0
+
 # Depth strip regions (same as vision.py)
 STRIP_LEFT = (0, FRAME_WIDTH // 3)
 STRIP_CENTER = (FRAME_WIDTH // 3, 2 * FRAME_WIDTH // 3)
@@ -47,11 +53,13 @@ class SLAMResult:
 
     depth_map: np.ndarray        # H×W float32 meters (at model resolution)
     camera_pose: np.ndarray      # 4×4 float64 (world-from-camera)
+    pose_valid: bool             # True when camera_pose is suitable for visualization/control
     tracking_quality: float      # 0..1
     num_points: int              # total points in map
     num_keyframes: int = 0       # total keyframes currently stored
     tracking_lost: bool = False  # True when tracker requests relocalization
     new_keyframe: bool = False   # True when a new keyframe was just added
+    tracking_stable: bool = True # False when the latest tracked step looks implausible
 
 
 @dataclass
@@ -91,6 +99,8 @@ def _ensure_on_path() -> Path:
 
 def _attempt_relocalization(states, keyframes, factor_graph, retrieval_database, cfg: dict) -> bool:
     """Mirror upstream retrieval-based relocalization for lost tracking."""
+    import lietorch
+
     frame = states.get_frame()
     with keyframes.lock:
         kf_idx = []
@@ -101,41 +111,89 @@ def _attempt_relocalization(states, keyframes, factor_graph, retrieval_database,
             min_thresh=cfg["retrieval"]["min_thresh"],
         )
         kf_idx += retrieval_inds
+        max_reloc_candidates = int(cfg.get("reloc", {}).get("max_candidates", 3))
+        if max_reloc_candidates > 0:
+            kf_idx = list(kf_idx)[:max_reloc_candidates]
         successful_loop_closure = False
 
         if kf_idx:
+            n_factors_before = len(factor_graph.ii)
             keyframes.append(frame)
             n_kf = len(keyframes)
             kf_idx = list(kf_idx)
             frame_idx = [n_kf - 1] * len(kf_idx)
             print(f"[Backend] RELOCALIZING against KF {n_kf - 1} and {kf_idx}", flush=True)
 
-            if factor_graph.add_factors(
-                frame_idx,
-                kf_idx,
-                cfg["reloc"]["min_match_frac"],
-                is_reloc=cfg["reloc"]["strict"],
-            ):
-                retrieval_database.update(
-                    frame,
-                    add_after_query=True,
-                    k=cfg["retrieval"]["k"],
-                    min_thresh=cfg["retrieval"]["min_thresh"],
+            try:
+                added = factor_graph.add_factors(
+                    frame_idx,
+                    kf_idx,
+                    cfg["reloc"]["min_match_frac"],
+                    is_reloc=cfg["reloc"]["strict"],
                 )
+            except torch.OutOfMemoryError:
+                keyframes.pop_last()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(
+                    f"[Backend] Relocalization OOM with candidates {kf_idx}; skipping attempt",
+                    flush=True,
+                )
+                return False
+
+            if added:
                 keyframes.T_WC[n_kf - 1] = keyframes.T_WC[kf_idx[0]].clone()
+                try:
+                    if cfg["use_calib"]:
+                        factor_graph.solve_GN_calib()
+                    else:
+                        factor_graph.solve_GN_rays()
+                except torch.OutOfMemoryError:
+                    keyframes.pop_last()
+                    _truncate_factor_graph(factor_graph, n_factors_before)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    print(
+                        f"[Backend] Relocalization solve OOM with candidates {kf_idx}; rolled back",
+                        flush=True,
+                    )
+                    return False
+                except Exception as exc:
+                    keyframes.pop_last()
+                    _truncate_factor_graph(factor_graph, n_factors_before)
+                    print(
+                        f"[Backend] Relocalization solve failed: {exc}; rolled back",
+                        flush=True,
+                    )
+                    return False
+
+                # Use relocalization to re-seed the current frame pose, but
+                # do not keep the temporary relocalization frame as a durable
+                # keyframe until frontend tracking proves it can continue.
+                relocalized_pose = keyframes.T_WC[n_kf - 1].clone()
+                frame.T_WC = lietorch.Sim3(relocalized_pose)
+                states.set_frame(frame)
+                keyframes.pop_last()
+                _truncate_factor_graph(factor_graph, n_factors_before)
                 successful_loop_closure = True
-                print("[Backend] Relocalization succeeded", flush=True)
+                print("[Backend] Relocalization succeeded (pose re-seeded)", flush=True)
             else:
                 keyframes.pop_last()
                 print("[Backend] Relocalization failed", flush=True)
 
-        if successful_loop_closure:
-            if cfg["use_calib"]:
-                factor_graph.solve_GN_calib()
-            else:
-                factor_graph.solve_GN_rays()
-
         return successful_loop_closure
+
+
+def _truncate_factor_graph(factor_graph, edge_count: int) -> None:
+    """Roll back factor-graph edge tensors to a known prefix length."""
+    factor_graph.ii = factor_graph.ii[:edge_count]
+    factor_graph.jj = factor_graph.jj[:edge_count]
+    factor_graph.idx_ii2jj = factor_graph.idx_ii2jj[:edge_count]
+    factor_graph.idx_jj2ii = factor_graph.idx_jj2ii[:edge_count]
+    factor_graph.valid_match_j = factor_graph.valid_match_j[:edge_count]
+    factor_graph.valid_match_i = factor_graph.valid_match_i[:edge_count]
+    factor_graph.Q_ii2jj = factor_graph.Q_ii2jj[:edge_count]
+    factor_graph.Q_jj2ii = factor_graph.Q_jj2ii[:edge_count]
 
 
 def _run_backend_wrapper(cfg, model, states, keyframes, K, mast3r_root):
@@ -191,6 +249,7 @@ def _run_backend_wrapper(cfg, model, states, keyframes, K, mast3r_root):
             time.sleep(0.01)
             continue
 
+        n_factors_before = len(factor_graph.ii)
         try:
             # Graph construction — connect to previous + retrieved keyframes
             kf_idx = []
@@ -213,8 +272,6 @@ def _run_backend_wrapper(cfg, model, states, keyframes, K, mast3r_root):
 
             kf_idx = list(set(kf_idx) - {idx})
             frame_idx = [idx] * len(kf_idx)
-
-            n_factors_before = len(factor_graph.ii) if hasattr(factor_graph, 'ii') else 0
 
             if kf_idx:
                 factor_graph.add_factors(
@@ -243,8 +300,17 @@ def _run_backend_wrapper(cfg, model, states, keyframes, K, mast3r_root):
             with states.lock:
                 if len(states.global_optimizer_tasks) > 0:
                     states.global_optimizer_tasks.pop(0)
+        except torch.OutOfMemoryError as e:
+            _truncate_factor_graph(factor_graph, n_factors_before)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(f"[Backend] OOM optimizing KF {idx}: {e}", flush=True)
+            with states.lock:
+                if len(states.global_optimizer_tasks) > 0:
+                    states.global_optimizer_tasks.pop(0)
         except Exception as e:
             import traceback
+            _truncate_factor_graph(factor_graph, n_factors_before)
             print(f"[Backend] ERROR optimizing KF {idx}: {e}", flush=True)
             traceback.print_exc()
             with states.lock:
@@ -290,6 +356,20 @@ class SplatSLAM:
         self._img_size = 512  # MASt3R supports 224 or 512 only
         self._use_calib = False
         self._intrinsics = None
+        self._last_export_point_count = 0
+        self._last_pose_valid = False
+        self._last_good_pose = np.eye(4)
+        self._suppress_keyframes_until_frame = 0
+        self._keyframe_start_frame = self.WARMUP_FRAMES
+
+    def suppress_keyframes(self, frame_count: int) -> None:
+        """Temporarily block new keyframe creation for a small number of frames."""
+        if frame_count <= 0:
+            return
+        self._suppress_keyframes_until_frame = max(
+            self._suppress_keyframes_until_frame,
+            self._frame_idx + int(frame_count),
+        )
 
     def _resolve_calibration_path(self) -> Path | None:
         if not self._calibration_path:
@@ -375,16 +455,33 @@ class SplatSLAM:
 
         # Upstream defaults are conservative for offline datasets. Our live robot stream
         # benefits from broader retrieval and less strict relocalization acceptance.
-        config["retrieval"]["k"] = max(int(config["retrieval"]["k"]), 5)
+        config["tracking"]["min_match_frac"] = min(
+            float(config["tracking"]["min_match_frac"]), 0.03
+        )
+        config["tracking"]["match_frac_thresh"] = max(
+            float(config["tracking"]["match_frac_thresh"]), 0.65
+        )
+        config["tracking"]["pixel_border"] = min(
+            int(config["tracking"]["pixel_border"]), -40
+        )
+        config["local_opt"]["pixel_border"] = min(
+            int(config["local_opt"]["pixel_border"]), -40
+        )
+        config["retrieval"]["k"] = max(int(config["retrieval"]["k"]), 4)
         config["retrieval"]["min_thresh"] = min(float(config["retrieval"]["min_thresh"]), 1e-3)
         config["reloc"]["min_match_frac"] = min(float(config["reloc"]["min_match_frac"]), 0.15)
         config["reloc"]["strict"] = False
+        config["reloc"]["max_candidates"] = min(int(config["retrieval"]["k"]), 2)
         log.info(
-            "Live relocalization tuning: retrieval.k=%d min_thresh=%.4g reloc.min_match_frac=%.2f strict=%s",
+            "Live tracking/relocalization tuning: min_match_frac=%.2f match_frac_thresh=%.2f pixel_border=%d retrieval.k=%d min_thresh=%.4g reloc.min_match_frac=%.2f strict=%s max_candidates=%d",
+            float(config["tracking"]["min_match_frac"]),
+            float(config["tracking"]["match_frac_thresh"]),
+            int(config["tracking"]["pixel_border"]),
             int(config["retrieval"]["k"]),
             float(config["retrieval"]["min_thresh"]),
             float(config["reloc"]["min_match_frac"]),
             bool(config["reloc"]["strict"]),
+            int(config["reloc"]["max_candidates"]),
         )
 
         # Load the MASt3R model (use full path to checkpoint)
@@ -443,6 +540,23 @@ class SplatSLAM:
         else:
             log.info("MASt3R-SLAM loaded — no calibration mode (Sim3)")
 
+    @staticmethod
+    def _pose_step_is_plausible(prev_pose: np.ndarray, next_pose: np.ndarray) -> tuple[bool, float, float]:
+        delta_t = next_pose[:3, 3] - prev_pose[:3, 3]
+        translation_m = float(np.linalg.norm(delta_t))
+
+        R_prev = prev_pose[:3, :3]
+        R_next = next_pose[:3, :3]
+        R_delta = R_prev.T @ R_next
+        trace = float(np.trace(R_delta))
+        angle_deg = float(np.degrees(np.arccos(max(-1.0, min(1.0, (trace - 1.0) / 2.0)))))
+
+        plausible = (
+            translation_m <= MAX_TRACK_TRANSLATION_STEP_M
+            and angle_deg <= MAX_TRACK_ROTATION_STEP_DEG
+        )
+        return plausible, translation_m, angle_deg
+
     def process_frame(self, jpeg_bytes: bytes, timestamp: float) -> SLAMResult | None:
         """Process a single JPEG frame through MASt3R-SLAM.
 
@@ -467,13 +581,19 @@ class SplatSLAM:
         from mast3r_slam.frame import create_frame, Mode
         from mast3r_slam.mast3r_utils import mast3r_inference_mono
         import lietorch
+        tracking_stable = True
 
         try:
-            # Create initial pose — identity for first frame, last pose for subsequent
+            # Create initial pose — follow upstream and seed from shared state
+            # once initialization has happened, rather than from a private
+            # frontend-only last_frame pointer.
             if not self._initialized:
                 T_WC = lietorch.Sim3.Identity(1, device=self._device)
             else:
-                T_WC = self._last_frame.T_WC
+                try:
+                    T_WC = self._states.get_frame().T_WC
+                except Exception:
+                    T_WC = self._last_frame.T_WC
 
             # create_frame expects float32 [0,1] RGB numpy array
             frame = create_frame(
@@ -505,6 +625,23 @@ class SplatSLAM:
                 else:
                 # Track against keyframes
                     add_new_kf, match_info, try_reloc = self._tracker.track(frame)
+
+                    if not try_reloc:
+                        pose_matrix = frame.T_WC.matrix().detach().cpu().numpy()
+                        if pose_matrix.ndim == 3:
+                            pose_matrix = pose_matrix[0]
+                        plausible, step_m, step_deg = self._pose_step_is_plausible(
+                            self._last_good_pose,
+                            pose_matrix,
+                        )
+                        tracking_stable = plausible
+                        if not plausible:
+                            log.warning(
+                                "Implausible tracking step at frame %d: %.3fm %.1fdeg",
+                                self._frame_idx,
+                                step_m,
+                                step_deg,
+                            )
 
                     if try_reloc:
                         if not hasattr(self, '_reloc_count'):
@@ -541,12 +678,24 @@ class SplatSLAM:
 
                 self._new_kf_this_frame = False
                 if add_new_kf:
-                    self._keyframes.append(frame)
-                    self._states.queue_global_optimization(len(self._keyframes) - 1)
-                    self._new_kf_this_frame = True
-                    log.info("New keyframe added (total: %d)", len(self._keyframes))
+                    if self._frame_idx < self._keyframe_start_frame:
+                        log.info(
+                            "Keyframe suppressed at frame %d during startup stabilization",
+                            self._frame_idx,
+                        )
+                    elif self._frame_idx < self._suppress_keyframes_until_frame:
+                        log.info(
+                            "Keyframe suppressed at frame %d during stabilization window",
+                            self._frame_idx,
+                        )
+                    else:
+                        self._keyframes.append(frame)
+                        self._states.queue_global_optimization(len(self._keyframes) - 1)
+                        self._new_kf_this_frame = True
+                        log.info("New keyframe added (total: %d)", len(self._keyframes))
 
-                self._last_frame = frame
+                if not try_reloc:
+                    self._last_frame = frame
 
         except Exception:
             log.exception("MASt3R-SLAM frame processing failed")
@@ -561,9 +710,14 @@ class SplatSLAM:
             pose_matrix = frame.T_WC.matrix().detach().cpu().numpy().astype(np.float64)
             if pose_matrix.ndim == 3:
                 pose_matrix = pose_matrix[0]  # Remove batch dim
-            self._last_pose = pose_matrix
+            pose_valid = not getattr(self, '_reloc_count', 0) > 0
+            if pose_valid:
+                self._last_pose = pose_matrix
+                self._last_good_pose = pose_matrix
+            self._last_pose_valid = pose_valid
         except Exception:
             pose_matrix = self._last_pose
+            pose_valid = self._last_pose_valid
 
         # Extract depth from the dense point map
         # MASt3R Sim3 mode: depths are relative, not metric.
@@ -609,11 +763,13 @@ class SplatSLAM:
         return SLAMResult(
             depth_map=depth_map,
             camera_pose=pose_matrix,
+            pose_valid=pose_valid,
             tracking_quality=quality,
             num_points=num_points,
             num_keyframes=num_kf,
             tracking_lost=getattr(self, '_reloc_count', 0) > 0,
             new_keyframe=getattr(self, '_new_kf_this_frame', False),
+            tracking_stable=tracking_stable,
         )
 
     def export_ply(self, path: str) -> bool:
@@ -628,14 +784,14 @@ class SplatSLAM:
             if n == 0:
                 log.warning("export_ply: 0 keyframes stored")
                 return False
-            self._export_ply_manual(path)
+            self._last_export_point_count = self._export_ply_manual(path)
             log.info("PLY exported: %s", path)
             return True
         except Exception:
             log.exception("Failed to export PLY")
             return False
 
-    def _export_ply_manual(self, path: str) -> None:
+    def _export_ply_manual(self, path: str) -> int:
         """Export point cloud from SharedKeyframes as colored PLY."""
         import lietorch
         from plyfile import PlyData, PlyElement
@@ -679,7 +835,7 @@ class SplatSLAM:
                 continue
 
         if not all_points:
-            return
+            return 0
 
         pts = np.concatenate(all_points, axis=0)
         colors = np.concatenate(all_colors, axis=0)
@@ -713,18 +869,14 @@ class SplatSLAM:
         PlyData([el], text=False).write(tmp_path)
         os.chmod(tmp_path, 0o644)
         os.replace(tmp_path, path)
+        return len(vertices)
 
     def get_pose(self) -> np.ndarray:
         return self._last_pose.copy()
 
     @property
-    def num_gaussians(self) -> int:
-        """Compatibility alias — returns total point count."""
-        try:
-            n = self._keyframes.num_keyframes if self._keyframes and hasattr(self._keyframes, 'num_keyframes') else 0
-            return n * self._img_size * self._img_size  # approximate
-        except Exception:
-            return 0
+    def exported_point_count(self) -> int:
+        return self._last_export_point_count
 
     @property
     def tracking_quality(self) -> float:

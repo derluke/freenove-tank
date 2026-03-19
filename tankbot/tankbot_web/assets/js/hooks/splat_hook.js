@@ -1,12 +1,12 @@
 /**
- * SplatViewer hook — renders the 3D Gaussian Splat map as a point cloud.
+ * SplatViewer hook — renders the exported 3D point-cloud map.
  *
- * Loads the PLY exported by MonoGS SLAM and displays Gaussian centers
- * as colored points using Three.js.  Receives updates from the server
+ * Loads the PLY exported by the autonomy SLAM adapter and displays
+ * colored points using Three.js. Receives updates from the server
  * via push_event("splat_update", data).
  *
  * Data shape:
- *   { ply_version: int, camera_pose: [16 floats], tracking_quality: float, num_gaussians: int }
+ *   { ply_version: int, camera_pose: [16 floats] | null, pose_valid: bool, tracking_quality: float, num_points: int }
  */
 import * as THREE from "three"
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js"
@@ -41,7 +41,9 @@ export const SplatViewer = {
         this._loadPLY(`/assets/splat/scene.ply?v=${data.ply_version}`)
       }
 
-      if (data.camera_pose && data.camera_pose.length === 16) {
+      if (data.pose_valid === false || !data.camera_pose) {
+        this.robotMarker.visible = false
+      } else if (data.camera_pose.length === 16) {
         this._updateRobotMarker(data.camera_pose)
       }
     })
