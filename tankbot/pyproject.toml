@@ -29,6 +29,7 @@ desktop = [
 [project.scripts]
 tankbot-robot = "tankbot.robot.main:main"
 tankbot-vision = "tankbot.desktop.autonomy.vision:main"
+tankbot-calibrate-camera = "tankbot.desktop.autonomy.calibrate_camera:main"
 
 [build-system]
 requires = ["hatchling"]

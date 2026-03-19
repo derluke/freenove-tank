@@ -1,10 +1,11 @@
-"""MASt3R-SLAM adapter — dense monocular SLAM without calibration.
+"""MASt3R-SLAM adapter — dense monocular SLAM with optional calibration.
 
 Wraps MASt3R-SLAM for online frame-by-frame operation. Produces dense
 colored point clouds and camera poses from a monocular RGB stream.
 
-No camera calibration required — MASt3R estimates geometry from learned
-priors (Sim3 poses with relative scale).
+Camera calibration is optional. Without intrinsics, MASt3R estimates
+geometry from learned priors (Sim3 poses with relative scale). With
+intrinsics enabled, the backend switches to the calibrated optimizer.
 
 Requires:
   - MASt3R-SLAM cloned into vendor/MASt3R-SLAM (see `task slam:setup`)
@@ -21,10 +22,12 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
 import torch
+import yaml
 
 log = logging.getLogger(__name__)
 
@@ -46,8 +49,21 @@ class SLAMResult:
     camera_pose: np.ndarray      # 4×4 float64 (world-from-camera)
     tracking_quality: float      # 0..1
     num_points: int              # total points in map
+    num_keyframes: int = 0       # total keyframes currently stored
     tracking_lost: bool = False  # True when tracker requests relocalization
     new_keyframe: bool = False   # True when a new keyframe was just added
+
+
+@dataclass
+class CameraCalibration:
+    """Undistortion maps plus resized-frame intrinsics for calibrated mode."""
+
+    K_frame: np.ndarray
+    mapx: np.ndarray
+    mapy: np.ndarray
+
+    def remap(self, img: np.ndarray) -> np.ndarray:
+        return cv2.remap(img, self.mapx, self.mapy, cv2.INTER_LINEAR)
 
 
 def _find_mast3r_root() -> Path:
@@ -73,7 +89,56 @@ def _ensure_on_path() -> Path:
     return root
 
 
-def _run_backend_wrapper(cfg, model, states, keyframes, mast3r_root):
+def _attempt_relocalization(states, keyframes, factor_graph, retrieval_database, cfg: dict) -> bool:
+    """Mirror upstream retrieval-based relocalization for lost tracking."""
+    frame = states.get_frame()
+    with keyframes.lock:
+        kf_idx = []
+        retrieval_inds = retrieval_database.update(
+            frame,
+            add_after_query=False,
+            k=cfg["retrieval"]["k"],
+            min_thresh=cfg["retrieval"]["min_thresh"],
+        )
+        kf_idx += retrieval_inds
+        successful_loop_closure = False
+
+        if kf_idx:
+            keyframes.append(frame)
+            n_kf = len(keyframes)
+            kf_idx = list(kf_idx)
+            frame_idx = [n_kf - 1] * len(kf_idx)
+            print(f"[Backend] RELOCALIZING against KF {n_kf - 1} and {kf_idx}", flush=True)
+
+            if factor_graph.add_factors(
+                frame_idx,
+                kf_idx,
+                cfg["reloc"]["min_match_frac"],
+                is_reloc=cfg["reloc"]["strict"],
+            ):
+                retrieval_database.update(
+                    frame,
+                    add_after_query=True,
+                    k=cfg["retrieval"]["k"],
+                    min_thresh=cfg["retrieval"]["min_thresh"],
+                )
+                keyframes.T_WC[n_kf - 1] = keyframes.T_WC[kf_idx[0]].clone()
+                successful_loop_closure = True
+                print("[Backend] Relocalization succeeded", flush=True)
+            else:
+                keyframes.pop_last()
+                print("[Backend] Relocalization failed", flush=True)
+
+        if successful_loop_closure:
+            if cfg["use_calib"]:
+                factor_graph.solve_GN_calib()
+            else:
+                factor_graph.solve_GN_rays()
+
+        return successful_loop_closure
+
+
+def _run_backend_wrapper(cfg, model, states, keyframes, K, mast3r_root):
     """Backend process entry point — runs global optimization + loop closure."""
     import os, sys, traceback
     os.chdir(str(mast3r_root))  # Checkpoints use relative paths
@@ -89,7 +154,7 @@ def _run_backend_wrapper(cfg, model, states, keyframes, mast3r_root):
         set_global_config(cfg)
         device = keyframes.device
 
-        factor_graph = FactorGraph(model, keyframes, keyframes.K, device)
+        factor_graph = FactorGraph(model, keyframes, K, device)
         retrieval_database = load_retriever(model)
         print("[Backend] Initialized successfully", flush=True)
     except Exception as e:
@@ -105,7 +170,16 @@ def _run_backend_wrapper(cfg, model, states, keyframes, mast3r_root):
             continue
 
         if mode == Mode.RELOC:
-            # Import relocalization from main.py
+            with states.lock:
+                pending_reloc = states.reloc_sem.value
+            if pending_reloc == 0:
+                time.sleep(0.01)
+                continue
+            success = _attempt_relocalization(
+                states, keyframes, factor_graph, retrieval_database, config
+            )
+            if success:
+                states.set_mode(Mode.TRACKING)
             states.dequeue_reloc()
             continue
 
@@ -153,11 +227,18 @@ def _run_backend_wrapper(cfg, model, states, keyframes, mast3r_root):
                 states.edges_ii[:] = factor_graph.ii.cpu().tolist()
                 states.edges_jj[:] = factor_graph.jj.cpu().tolist()
 
-            # NOTE: solve_GN_rays() disabled — it collapses Sim3 scale in uncalibrated mode
-            # TODO: enable when we add camera intrinsics (calibration mode)
-            # factor_graph.solve_GN_rays()
+            if config["use_calib"]:
+                factor_graph.solve_GN_calib()
+                solve_mode = "calib"
+            else:
+                factor_graph.solve_GN_rays()
+                solve_mode = "rays"
 
-            print(f"[Backend] KF {idx}: {n_factors_after} factors, retrieval={retrieval_inds} (solve disabled)", flush=True)
+            print(
+                f"[Backend] KF {idx}: {n_factors_after} factors, retrieval={retrieval_inds} "
+                f"(solve={solve_mode})",
+                flush=True,
+            )
 
             with states.lock:
                 if len(states.global_optimizer_tasks) > 0:
@@ -188,9 +269,10 @@ class SplatSLAM:
     WARMUP_FRAMES = 5
     MAX_KEYFRAMES = 200
 
-    def __init__(self) -> None:
+    def __init__(self, calibration_path: str = "") -> None:
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self._mast3r_root: Path | None = None
+        self._calibration_path = calibration_path or os.environ.get("ROBOT_CAMERA_CALIB", "")
 
         # MASt3R-SLAM components (set in load())
         self._model = None
@@ -206,6 +288,70 @@ class SplatSLAM:
         self._last_pose = np.eye(4)
         self._initialized = False
         self._img_size = 512  # MASt3R supports 224 or 512 only
+        self._use_calib = False
+        self._intrinsics = None
+
+    def _resolve_calibration_path(self) -> Path | None:
+        if not self._calibration_path:
+            return None
+
+        candidates = [Path(self._calibration_path)]
+        if self._mast3r_root is not None:
+            candidates.append(self._mast3r_root / self._calibration_path)
+
+        for candidate in candidates:
+            candidate = candidate.expanduser()
+            if candidate.exists():
+                return candidate.resolve()
+
+        raise FileNotFoundError(
+            f"Calibration file not found: {self._calibration_path}"
+        )
+
+    def _load_calibration(self) -> tuple[Any, torch.Tensor] | tuple[None, None]:
+        calib_path = self._resolve_calibration_path()
+        if calib_path is None:
+            return None, None
+        from mast3r_slam.mast3r_utils import resize_img
+
+        with calib_path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+
+        width = int(data["width"])
+        height = int(data["height"])
+        calib = data["calibration"]
+        fx, fy, cx, cy = calib[:4]
+        distortion = np.zeros(4)
+        if len(calib) > 4:
+            distortion = np.array(calib[4:], dtype=np.float32)
+
+        K = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
+            dtype=np.float32,
+        )
+        center = True
+        K_opt, _ = cv2.getOptimalNewCameraMatrix(
+            K, distortion, (width, height), 0, (width, height), centerPrincipalPoint=center
+        )
+        mapx, mapy = cv2.initUndistortRectifyMap(
+            K, distortion, None, K_opt, (width, height), cv2.CV_32FC1
+        )
+
+        dummy = np.zeros((height, width, 3), dtype=np.float32)
+        _, (scale_w, scale_h, half_crop_w, half_crop_h) = resize_img(
+            dummy, self._img_size, return_transformation=True
+        )
+        K_frame = K_opt.copy()
+        K_frame[0, 0] = K_opt[0, 0] / scale_w
+        K_frame[1, 1] = K_opt[1, 1] / scale_h
+        K_frame[0, 2] = K_opt[0, 2] / scale_w - half_crop_w
+        K_frame[1, 2] = K_opt[1, 2] / scale_h - half_crop_h
+
+        intrinsics = CameraCalibration(K_frame=K_frame, mapx=mapx, mapy=mapy)
+
+        K = torch.from_numpy(intrinsics.K_frame).to(self._device, dtype=torch.float32)
+        log.info("Calibration mode enabled using %s", calib_path)
+        return intrinsics, K
 
     def load(self) -> None:
         """Initialize MASt3R-SLAM model and components."""
@@ -216,9 +362,30 @@ class SplatSLAM:
         from mast3r_slam.frame import SharedKeyframes
         from mast3r_slam.tracker import FrameTracker
 
-        # Load config — use base (no calibration, Sim3 mode)
-        config_path = self._mast3r_root / "config" / "base.yaml"
-        load_config(str(config_path))
+        calib_path = self._resolve_calibration_path()
+        config_name = "calib.yaml" if calib_path is not None else "base.yaml"
+        config_path = self._mast3r_root / "config" / config_name
+        prev_cwd = Path.cwd()
+        try:
+            os.chdir(self._mast3r_root)
+            load_config(f"config/{config_name}")
+        finally:
+            os.chdir(prev_cwd)
+        self._use_calib = bool(config.get("use_calib", False))
+
+        # Upstream defaults are conservative for offline datasets. Our live robot stream
+        # benefits from broader retrieval and less strict relocalization acceptance.
+        config["retrieval"]["k"] = max(int(config["retrieval"]["k"]), 5)
+        config["retrieval"]["min_thresh"] = min(float(config["retrieval"]["min_thresh"]), 1e-3)
+        config["reloc"]["min_match_frac"] = min(float(config["reloc"]["min_match_frac"]), 0.15)
+        config["reloc"]["strict"] = False
+        log.info(
+            "Live relocalization tuning: retrieval.k=%d min_thresh=%.4g reloc.min_match_frac=%.2f strict=%s",
+            int(config["retrieval"]["k"]),
+            float(config["retrieval"]["min_thresh"]),
+            float(config["reloc"]["min_match_frac"]),
+            bool(config["reloc"]["strict"]),
+        )
 
         # Load the MASt3R model (use full path to checkpoint)
         weights_path = str(self._mast3r_root / "checkpoints" / "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth")
@@ -241,6 +408,11 @@ class SplatSLAM:
             buffer=self.MAX_KEYFRAMES,
         )
 
+        K = None
+        if self._use_calib:
+            self._intrinsics, K = self._load_calibration()
+            self._keyframes.set_intrinsics(K)
+
         # Shared states for frontend/backend communication
         from mast3r_slam.frame import SharedStates, Mode
         self._states = SharedStates(
@@ -260,13 +432,16 @@ class SplatSLAM:
         self._model.share_memory()
         self._backend_process = mp.Process(
             target=_run_backend_wrapper,
-            args=(config, self._model, self._states, self._keyframes, self._mast3r_root),
+            args=(config, self._model, self._states, self._keyframes, K, self._mast3r_root),
             daemon=True,
         )
         self._backend_process.start()
         log.info("Backend optimization process started")
 
-        log.info("MASt3R-SLAM loaded — no calibration mode (Sim3)")
+        if self._use_calib:
+            log.info("MASt3R-SLAM loaded — calibration mode active")
+        else:
+            log.info("MASt3R-SLAM loaded — no calibration mode (Sim3)")
 
     def process_frame(self, jpeg_bytes: bytes, timestamp: float) -> SLAMResult | None:
         """Process a single JPEG frame through MASt3R-SLAM.
@@ -279,6 +454,8 @@ class SplatSLAM:
             return None
 
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        if self._intrinsics is not None:
+            img_rgb = self._intrinsics.remap(img_rgb)
 
         # MASt3R expects float32 in [0.0, 1.0] — resize_img does np.uint8(img * 255)
         # so passing uint8 directly causes overflow and corrupted images
@@ -316,26 +493,36 @@ class SplatSLAM:
                 self._last_frame = frame
                 log.info("MASt3R-SLAM initialized from first frame")
             else:
-                # Track against keyframes
-                add_new_kf, match_info, try_reloc = self._tracker.track(frame)
+                mode = self._states.get_mode()
 
-                if try_reloc:
-                    if not hasattr(self, '_reloc_count'):
-                        self._reloc_count = 0
-                    self._reloc_count += 1
-                    if self._reloc_count == 1 or self._reloc_count % 30 == 0:
-                        log.warning(
-                            "Tracking lost (frame %d, %d consecutive). Move camera toward known area.",
-                            self._frame_idx, self._reloc_count,
-                        )
-                    self._states.set_mode(Mode.RELOC)
+                if mode == Mode.RELOC:
+                    X, C = mast3r_inference_mono(self._model, frame)
+                    frame.update_pointmap(X, C)
+                    self._states.set_frame(frame)
+                    self._states.queue_reloc()
+                    add_new_kf = False
+                    try_reloc = True
                 else:
-                    if getattr(self, '_reloc_count', 0) > 0:
-                        # Recovered from reloc — re-enable backend optimization
-                        self._states.set_mode(Mode.TRACKING)
-                    self._reloc_count = 0
+                # Track against keyframes
+                    add_new_kf, match_info, try_reloc = self._tracker.track(frame)
 
-                self._states.set_frame(frame)
+                    if try_reloc:
+                        if not hasattr(self, '_reloc_count'):
+                            self._reloc_count = 0
+                        self._reloc_count += 1
+                        if self._reloc_count == 1 or self._reloc_count % 30 == 0:
+                            log.warning(
+                                "Tracking lost (frame %d, %d consecutive). Move camera toward known area.",
+                                self._frame_idx, self._reloc_count,
+                            )
+                        self._states.set_mode(Mode.RELOC)
+                    else:
+                        if getattr(self, '_reloc_count', 0) > 0:
+                            # Recovered from reloc — re-enable backend optimization
+                            self._states.set_mode(Mode.TRACKING)
+                        self._reloc_count = 0
+
+                    self._states.set_frame(frame)
 
                 # Log tracking diagnostics every 10 frames
                 if self._frame_idx % 10 == 0:
@@ -408,6 +595,7 @@ class SplatSLAM:
 
         # Count total points
         num_points = 0
+        num_kf = 0
         try:
             with self._keyframes.lock:
                 num_kf = self._keyframes.n_size.value
@@ -423,6 +611,7 @@ class SplatSLAM:
             camera_pose=pose_matrix,
             tracking_quality=quality,
             num_points=num_points,
+            num_keyframes=num_kf,
             tracking_lost=getattr(self, '_reloc_count', 0) > 0,
             new_keyframe=getattr(self, '_new_kf_this_frame', False),
         )
@@ -466,9 +655,8 @@ class SplatSLAM:
                     C = kf.C[i]         # [H*W, 1] confidence
                     uimg = kf.uimg[i]   # [H, W, 3] unnormalized image (CPU, 0-1)
 
-                # Filter by confidence
                 conf = C.squeeze(-1)
-                mask = conf > 1.0  # MASt3R confidence is exp-scaled, >1 is decent
+                mask = conf > 1.0
 
                 if mask.sum() < 10:
                     continue

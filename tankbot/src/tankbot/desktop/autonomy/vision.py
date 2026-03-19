@@ -45,7 +45,10 @@ MIN_DUTY = 1000
 
 # Pulse-and-coast: short burst then stop to keep speed low
 PULSE_DURATION = 0.25   # seconds of motor power per step
-COAST_PAUSE = 0.20      # seconds of coasting (motors off) between pulses
+COAST_PAUSE = 0.08      # seconds of coasting (motors off) between pulses
+RECOVERY_REVERSE_DURATION = 0.30
+RECOVERY_TURN_DURATION = 0.35
+RECOVERY_SETTLE_DURATION = 0.25
 
 # Stuck detection
 STUCK_POSITION_THRESHOLD = 0.02  # meters — less movement than this = stuck
@@ -58,6 +61,9 @@ US_CLEAR = 100            # farther than 1m → full confidence
 
 # Initial scan: rotate in place to build panoramic map before moving
 INITIAL_SCAN_STEPS = 8    # number of turn pulses at startup
+STARTUP_SETTLE_SECONDS = 1.5
+INITIAL_SCAN_TURN_DURATION = 0.22
+INITIAL_SCAN_RECOVERY_REVERSE_DURATION = 0.25
 
 # We divide the frame into three vertical strips for steering decisions
 STRIP_LEFT = (0, FRAME_WIDTH // 3)
@@ -101,13 +107,14 @@ FORCE_DEBUG = False
 
 class VisionEngine:
     def __init__(self, robot_url: str = "", debug: bool = False,
-                 splat_dir: str = "", record: bool = False) -> None:
+                 splat_dir: str = "", record: bool = False,
+                 calib_path: str = "") -> None:
         debug = debug or FORCE_DEBUG
         self._record = record
         self._record_file = None
         robot_url = robot_url or os.environ.get("ROBOT_URL", "ws://localhost:9000")
         self._client = RobotClient(robot_url)
-        self._slam = SplatSLAM()
+        self._slam = SplatSLAM(calibration_path=calib_path)
         self._latest_frame: bytes | None = None
         self._latest_telemetry: dict = {}
         self._running = False
@@ -116,6 +123,8 @@ class VisionEngine:
         self._state_since = time.monotonic()
         self._last_turn_dir: int = 1
         self._current_motor = (0, 0)
+        self._last_nonzero_motor = (0, 0)
+        self._last_maneuver: tuple[int, int, float] | None = None
         self._us_history: list[float] = []
 
         # PLY export state
@@ -130,6 +139,10 @@ class VisionEngine:
         self._kf_rate = 0.0        # keyframes per frame (rolling)
         self._initial_scan_done = False
         self._scan_steps_remaining = 0
+        self._startup_ready_since: float | None = None
+        self._lost_recovery_reversed = False
+        self._scan_loss_recovery_reversed = False
+        self._scan_turn_dir = 1
         # depth_scale no longer used — US for distance, SLAM for steering only
 
     @staticmethod
@@ -204,10 +217,27 @@ class VisionEngine:
 
     async def _motor(self, left: int, right: int) -> None:
         self._current_motor = (left, right)
+        if left != 0 or right != 0:
+            self._last_nonzero_motor = (left, right)
         await self._client.send_motor(left, right)
 
     async def _stop(self) -> None:
         await self._motor(0, 0)
+
+    async def _run_maneuver(self, left: int, right: int, duration: float, *, remember: bool = True) -> None:
+        if remember and (left != 0 or right != 0):
+            self._last_maneuver = (left, right, duration)
+        await self._motor(left, right)
+        await asyncio.sleep(duration)
+        await self._stop()
+
+    def _inverse_last_maneuver(self, default_duration: float) -> tuple[int, int, float] | None:
+        if self._last_maneuver is None:
+            return None
+        left, right, duration = self._last_maneuver
+        if left == 0 and right == 0:
+            return None
+        return -left, -right, max(duration, default_duration)
 
     def _filter_distance(self, raw: float) -> float:
         if raw <= 0 or raw > US_MAX_TRUSTED:
@@ -231,6 +261,25 @@ class VisionEngine:
             self._ply_version += 1
             self._last_ply_export = now
             log.info("PLY v%d exported (%d Gaussians)", self._ply_version, self._slam.num_gaussians)
+
+    def _startup_ready(self, slam_result) -> bool:
+        if slam_result is None or slam_result.tracking_lost or slam_result.num_keyframes < 1:
+            self._startup_ready_since = None
+            return False
+
+        now = time.monotonic()
+        if self._startup_ready_since is None:
+            self._startup_ready_since = now
+            log.info("Startup warmup: first keyframe available, settling for %.1fs", STARTUP_SETTLE_SECONDS)
+            return False
+
+        return (now - self._startup_ready_since) >= STARTUP_SETTLE_SECONDS
+
+    def _reverse_last_action(self) -> tuple[int, int] | None:
+        left, right = self._last_nonzero_motor
+        if left == 0 and right == 0:
+            return None
+        return -left, -right
 
     async def _send_vision_status(self, us_distance: float,
                                   depth_strips: tuple[float, float, float],
@@ -362,6 +411,20 @@ class VisionEngine:
 
             await self._send_vision_status(us_distance, depth_strips, slam_result)
 
+            # Let MASt3R-SLAM settle before any autonomous movement.
+            # Only gate startup behavior before the initial scan completes;
+            # otherwise tracking-loss recovery never gets a chance to run.
+            if (
+                not self._initial_scan_done
+                and self._scan_steps_remaining == 0
+                and not self._startup_ready(slam_result)
+            ):
+                self._set_state(State.SCANNING)
+                if not self._debug:
+                    await self._stop()
+                await asyncio.sleep(0.1)
+                continue
+
             # === Initial scan: rotate in place to build panoramic map ===
             if not self._initial_scan_done and not self._debug:
                 if self._scan_steps_remaining == 0:
@@ -371,31 +434,47 @@ class VisionEngine:
                 # If tracking lost during scan, wait for recovery
                 if slam_result is not None and slam_result.tracking_lost:
                     await self._stop()
-                    await asyncio.sleep(0.3)
+                    if not self._scan_loss_recovery_reversed:
+                        inverse = self._inverse_last_maneuver(INITIAL_SCAN_RECOVERY_REVERSE_DURATION)
+                        if inverse is not None:
+                            unwind_left, unwind_right, unwind_duration = inverse
+                            log.info(
+                                "Initial scan lost tracking — undoing last turn (%d, %d) for %.2fs",
+                                unwind_left, unwind_right, unwind_duration,
+                            )
+                            await self._run_maneuver(
+                                unwind_left,
+                                unwind_right,
+                                unwind_duration,
+                                remember=False,
+                            )
+                            self._scan_loss_recovery_reversed = True
+                    else:
+                        log.info("Initial scan recovery failed — aborting scan and switching to normal recovery")
+                        self._initial_scan_done = True
+                        self._scan_steps_remaining = 0
+                        self._scan_loss_recovery_reversed = False
+                    await asyncio.sleep(0.4)
                     continue
 
                 self._set_state(State.SCANNING)
                 # High power, short pulse — overcome friction without overshooting
-                await self._motor(-TURN_SPEED, TURN_SPEED)
-                await asyncio.sleep(0.35)
-                await self._stop()
-                await asyncio.sleep(0.6)  # long pause for SLAM to track the new view
+                self._scan_turn_dir = 1
+                await self._run_maneuver(
+                    -self._scan_turn_dir * TURN_SPEED,
+                    self._scan_turn_dir * TURN_SPEED,
+                    INITIAL_SCAN_TURN_DURATION,
+                )
+                await asyncio.sleep(0.35)  # brief settle so SLAM can track the new view
                 self._scan_steps_remaining -= 1
+                self._scan_loss_recovery_reversed = False
 
                 if self._scan_steps_remaining <= 0:
                     self._initial_scan_done = True
                     log.info("Initial scan complete — starting exploration")
                 continue
 
-            # During warmup (no depth yet), stay still
-            if slam_result is None:
-                self._set_state(State.SCANNING)
-                if not self._debug:
-                    await self._stop()
-                await asyncio.sleep(0.1)
-                continue
-
-            # Tracking lost — stop and turn to find known features. NEVER reverse.
+            # Tracking lost — first undo the last motion, then fall back to scan turns.
             if slam_result.tracking_lost:
                 if not hasattr(self, '_lost_count'):
                     self._lost_count = 0
@@ -404,21 +483,42 @@ class VisionEngine:
                 if not self._debug:
                     if self._lost_count == 1:
                         log.info("Tracking lost — stopping")
+                        self._lost_recovery_reversed = False
                         await self._stop()
+                    elif not self._lost_recovery_reversed and self._lost_count >= 3:
+                        inverse = self._inverse_last_maneuver(RECOVERY_REVERSE_DURATION)
+                        if inverse is not None:
+                            reverse_left, reverse_right, reverse_duration = inverse
+                            log.info(
+                                "Tracking lost (%d frames) — undoing last maneuver (%d, %d) for %.2fs",
+                                self._lost_count, reverse_left, reverse_right, reverse_duration,
+                            )
+                            self._set_state(State.BACKING_UP)
+                            await self._run_maneuver(
+                                reverse_left,
+                                reverse_right,
+                                reverse_duration,
+                                remember=False,
+                            )
+                            self._lost_recovery_reversed = True
                     elif self._lost_count % 15 == 0:
-                        # Periodically turn in place to find known features
                         log.info("Tracking lost (%d frames) — turning to re-acquire", self._lost_count)
                         self._set_state(State.SCANNING)
-                        await self._motor(-TURN_SPEED, TURN_SPEED)
-                        await asyncio.sleep(0.35)
-                        await self._stop()
+                        turn_dir = -1 if self._last_nonzero_motor[0] > self._last_nonzero_motor[1] else 1
+                        self._last_turn_dir = turn_dir
+                        await self._run_maneuver(
+                            -turn_dir * TURN_SPEED,
+                            turn_dir * TURN_SPEED,
+                            RECOVERY_TURN_DURATION,
+                        )
 
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(RECOVERY_SETTLE_DURATION)
                 continue
             else:
                 if getattr(self, '_lost_count', 0) > 0:
                     log.info("Tracking recovered after %d lost frames", self._lost_count)
                 self._lost_count = 0
+                self._lost_recovery_reversed = False
 
             # SLAM strips are relative — use for steering direction only
             # Ultrasonic is absolute cm — use for speed and stop/go decisions
@@ -449,11 +549,9 @@ class VisionEngine:
                     log.info("Stuck detected — turning")
                     self._set_state(State.SCANNING)
                     if strip_l > strip_r:
-                        await self._motor(-TURN_SPEED, TURN_SPEED)
+                        await self._run_maneuver(-TURN_SPEED, TURN_SPEED, 0.35)
                     else:
-                        await self._motor(TURN_SPEED, -TURN_SPEED)
-                    await asyncio.sleep(0.35)
-                    await self._stop()
+                        await self._run_maneuver(TURN_SPEED, -TURN_SPEED, 0.35)
                     self._stuck_count = 0
                     self._last_nav_pose = None
                     await asyncio.sleep(0.4)
@@ -464,11 +562,9 @@ class VisionEngine:
                 self._set_state(State.SCANNING)
                 await self._stop()
                 if strip_l > strip_r:
-                    await self._motor(-TURN_SPEED, TURN_SPEED)
+                    await self._run_maneuver(-TURN_SPEED, TURN_SPEED, 0.35)
                 else:
-                    await self._motor(TURN_SPEED, -TURN_SPEED)
-                await asyncio.sleep(0.35)
-                await self._stop()
+                    await self._run_maneuver(TURN_SPEED, -TURN_SPEED, 0.35)
                 await asyncio.sleep(0.4)
                 continue
 
@@ -510,9 +606,7 @@ class VisionEngine:
 
             # Pulse-and-coast
             pulse = PULSE_DURATION + 0.15 * familiarity
-            await self._motor(left_speed, right_speed)
-            await asyncio.sleep(pulse)
-            await self._stop()
+            await self._run_maneuver(left_speed, right_speed, pulse)
             await asyncio.sleep(COAST_PAUSE)
 
     # ------------------------------------------------------------------
@@ -566,9 +660,20 @@ def main() -> None:
                         help="Debug mode: run SLAM but send no motor commands")
     parser.add_argument("--record", action="store_true",
                         help="Record driving data (use with --debug while driving manually)")
+    parser.add_argument(
+        "--calib",
+        default="",
+        help="Path to MASt3R-SLAM intrinsics YAML (or set ROBOT_CAMERA_CALIB env var)",
+    )
     args = parser.parse_args()
 
-    engine = VisionEngine(robot_url=args.robot, debug=args.debug, splat_dir=args.splat_dir, record=args.record)
+    engine = VisionEngine(
+        robot_url=args.robot,
+        debug=args.debug,
+        splat_dir=args.splat_dir,
+        record=args.record,
+        calib_path=args.calib,
+    )
     asyncio.run(engine.run())
 
 

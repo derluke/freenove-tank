@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="300mm" height="225mm" viewBox="0 0 300 225">
+  <rect width="300" height="225" fill="white"/>
+  <g fill="black">
+    <rect x="25" y="25" width="25" height="25"/>
+    <rect x="75" y="25" width="25" height="25"/>
+    <rect x="125" y="25" width="25" height="25"/>
+    <rect x="175" y="25" width="25" height="25"/>
+    <rect x="225" y="25" width="25" height="25"/>
+
+    <rect x="50" y="50" width="25" height="25"/>
+    <rect x="100" y="50" width="25" height="25"/>
+    <rect x="150" y="50" width="25" height="25"/>
+    <rect x="200" y="50" width="25" height="25"/>
+    <rect x="250" y="50" width="25" height="25"/>
+
+    <rect x="25" y="75" width="25" height="25"/>
+    <rect x="75" y="75" width="25" height="25"/>
+    <rect x="125" y="75" width="25" height="25"/>
+    <rect x="175" y="75" width="25" height="25"/>
+    <rect x="225" y="75" width="25" height="25"/>
+
+    <rect x="50" y="100" width="25" height="25"/>
+    <rect x="100" y="100" width="25" height="25"/>
+    <rect x="150" y="100" width="25" height="25"/>
+    <rect x="200" y="100" width="25" height="25"/>
+    <rect x="250" y="100" width="25" height="25"/>
+
+    <rect x="25" y="125" width="25" height="25"/>
+    <rect x="75" y="125" width="25" height="25"/>
+    <rect x="125" y="125" width="25" height="25"/>
+    <rect x="175" y="125" width="25" height="25"/>
+    <rect x="225" y="125" width="25" height="25"/>
+
+    <rect x="50" y="150" width="25" height="25"/>
+    <rect x="100" y="150" width="25" height="25"/>
+    <rect x="150" y="150" width="25" height="25"/>
+    <rect x="200" y="150" width="25" height="25"/>
+    <rect x="250" y="150" width="25" height="25"/>
+
+    <rect x="25" y="175" width="25" height="25"/>
+    <rect x="75" y="175" width="25" height="25"/>
+    <rect x="125" y="175" width="25" height="25"/>
+    <rect x="175" y="175" width="25" height="25"/>
+    <rect x="225" y="175" width="25" height="25"/>
+  </g>
+</svg>

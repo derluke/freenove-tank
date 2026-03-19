@@ -7,6 +7,7 @@ vars:
   PI_USER: '{{.PI_USER | default "pi"}}'
   PI_DIR: '{{.PI_DIR | default "/home/pi/tankbot"}}'
   LOCAL_DIR: '{{.ROOT_DIR}}'
+  CAMERA_CALIB: '{{.CAMERA_CALIB | default ""}}'
 
 tasks:
   # ---------------------------------------------------------------------------
@@ -101,6 +102,11 @@ tasks:
     cmds:
       - mix phx.server
 
+  tmux:dev:
+    desc: Open or attach to a tmux dev session for this repo
+    cmds:
+      - bash scripts/dev-tmux.sh
+
   web:iex:
     desc: Start Phoenix in interactive Elixir shell
     dir: tankbot_web
@@ -121,15 +127,47 @@ tasks:
     cmds:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000
 
+  vision:start:calib:
+    desc: Start the vision engine with camera calibration enabled
+    preconditions:
+      - sh: test -n "{{.CAMERA_CALIB}}"
+        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:start:calib CAMERA_CALIB=vendor/MASt3R-SLAM/config/intrinsics.yaml`
+    cmds:
+      - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --calib {{.CAMERA_CALIB}}
+
   vision:debug:
     desc: Vision debug mode — SLAM tracking, no motor commands
     cmds:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug
 
+  vision:debug:calib:
+    desc: Vision debug mode with camera calibration enabled
+    preconditions:
+      - sh: test -n "{{.CAMERA_CALIB}}"
+        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:debug:calib CAMERA_CALIB=vendor/MASt3R-SLAM/config/intrinsics.yaml`
+    cmds:
+      - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug --calib {{.CAMERA_CALIB}}
+
   vision:record:
     desc: Record manual driving — SLAM + your inputs saved to recordings/
     cmds:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug --record
+
+  vision:record:calib:
+    desc: Record manual driving with camera calibration enabled
+    preconditions:
+      - sh: test -n "{{.CAMERA_CALIB}}"
+        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:record:calib CAMERA_CALIB=vendor/MASt3R-SLAM/config/intrinsics.yaml`
+    cmds:
+      - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug --record --calib {{.CAMERA_CALIB}}
+
+  vision:calibrate:
+    desc: Capture checkerboard views from the robot stream and write camera intrinsics YAML
+    cmds:
+      - >-
+        uv run tankbot-calibrate-camera
+        --robot ws://{{.PI_HOST}}:9000
+        --output calibration/camera_intrinsics.yaml
 
   slam:setup:
     desc: Clone MASt3R-SLAM and build CUDA extensions

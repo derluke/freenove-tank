@@ -21,3 +21,6 @@ node_modules/
 # Models / Vendor
 tankbot/*.pt
 tankbot/vendor/
+tankbot/calibration/captures/*
+*.log
+*.csv
