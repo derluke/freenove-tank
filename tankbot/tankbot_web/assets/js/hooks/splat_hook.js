@@ -15,6 +15,7 @@ import { PLYLoader } from "three/examples/jsm/loaders/PLYLoader.js"
 export const SplatViewer = {
   mounted() {
     this.container = this.el
+    this.currentEpoch = this.el.dataset.plyEpoch || null
     this.currentVersion = 0
     this.renderer = null
     this.scene = null
@@ -33,12 +34,23 @@ export const SplatViewer = {
     this._showWaiting()
     this._animate()
 
+    const initialVersion = Number(this.el.dataset.plyVersion || 0)
+    if (initialVersion > 0) {
+      this.currentVersion = initialVersion
+      this._loadPLY(this._plyUrl(this.currentEpoch, initialVersion))
+    }
+
     this.handleEvent("splat_update", (data) => {
       this._hideWaiting()
 
+      if (data.ply_epoch && data.ply_epoch !== this.currentEpoch) {
+        this.currentEpoch = data.ply_epoch
+        this.currentVersion = 0
+      }
+
       if (data.ply_version && data.ply_version > this.currentVersion && !this.loading) {
         this.currentVersion = data.ply_version
-        this._loadPLY(`/assets/splat/scene.ply?v=${data.ply_version}`)
+        this._loadPLY(this._plyUrl(this.currentEpoch, data.ply_version))
       }
 
       if (data.pose_valid === false || !data.camera_pose) {
@@ -47,6 +59,13 @@ export const SplatViewer = {
         this._updateRobotMarker(data.camera_pose)
       }
     })
+  },
+
+  _plyUrl(epoch, version) {
+    const params = new URLSearchParams()
+    if (epoch) params.set("epoch", String(epoch))
+    params.set("v", String(version))
+    return `/assets/splat/scene.ply?${params.toString()}`
   },
 
   _initScene() {

@@ -28,6 +28,7 @@ defmodule TankbotWebWeb.DashboardLive do
        # SLAM state
        slam_tracking_quality: 0.0,
        slam_num_points: 0,
+       slam_ply_epoch: nil,
        slam_ply_version: 0,
        autonomy_goal: nil,
        autonomy_behavior: nil,
@@ -52,6 +53,7 @@ defmodule TankbotWebWeb.DashboardLive do
         depth_right: depth["right"] || 0.0,
         slam_tracking_quality: slam["tracking_quality"] || 0.0,
         slam_num_points: slam["num_points"] || slam["num_gaussians"] || 0,
+        slam_ply_epoch: slam["ply_epoch"] || socket.assigns.slam_ply_epoch,
         slam_ply_version: slam["ply_version"] || socket.assigns.slam_ply_version,
         autonomy_goal: autonomy["goal"] || socket.assigns.autonomy_goal,
         autonomy_behavior: autonomy["behavior"] || socket.assigns.autonomy_behavior,
@@ -64,6 +66,7 @@ defmodule TankbotWebWeb.DashboardLive do
       case slam["camera_pose"] do
         nil ->
           push_event(socket, "splat_update", %{
+            ply_epoch: slam["ply_epoch"] || socket.assigns.slam_ply_epoch,
             ply_version: slam["ply_version"] || socket.assigns.slam_ply_version,
             camera_pose: nil,
             pose_valid: false,
@@ -73,6 +76,7 @@ defmodule TankbotWebWeb.DashboardLive do
 
         camera_pose ->
           push_event(socket, "splat_update", %{
+            ply_epoch: slam["ply_epoch"] || socket.assigns.slam_ply_epoch,
             ply_version: slam["ply_version"] || socket.assigns.slam_ply_version,
             camera_pose: camera_pose,
             pose_valid: slam["pose_valid"] != false,
@@ -304,6 +308,8 @@ defmodule TankbotWebWeb.DashboardLive do
                   id="splat-viewer"
                   phx-hook="SplatViewer"
                   phx-update="ignore"
+                  data-ply-epoch={@slam_ply_epoch}
+                  data-ply-version={@slam_ply_version}
                   class="w-full rounded border border-gray-700"
                   style="height: 400px;"
                 ></div>

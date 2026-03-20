@@ -38,23 +38,29 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 
 # Speeds (duty values, max 4095) — calibrated from human driving
-EXPLORE_SPEED = 1500     # cautious speed in unknown territory
-CRUISE_SPEED = 1900      # confident speed in mapped territory
-TURN_SPEED = 1200
+EXPLORE_SPEED = 2000     # matched from manual driving recording
+CRUISE_SPEED = 2000      # matched from manual driving recording
+TURN_SPEED = 1500
 INITIAL_SCAN_TURN_SPEED = 1500
-NAV_TURN_SPEED = 1350
-RECOVERY_TURN_SPEED = 1300
-MIN_DUTY = 1200
+NAV_TURN_SPEED = 1500
+RECOVERY_TURN_SPEED = 1500
+MIN_DUTY = 1500
 
 # Pulse-and-coast: short burst then stop to keep speed low
-PULSE_DURATION = 0.20   # seconds of motor power per step
+PULSE_DURATION = 0.24   # seconds of motor power per step
 COAST_PAUSE = 0.08      # seconds of coasting (motors off) between pulses
 AVOIDANCE_BACKUP_DURATION = 0.10
 RECOVERY_REVERSE_DURATION = 0.30
-RECOVERY_TURN_DURATION = 0.20
+RECOVERY_TURN_DURATION = 0.24
 RECOVERY_SETTLE_DURATION = 0.25
 RECOVERY_STABLE_FRAMES = 3
+RECOVERY_UNDO_DELAY_FRAMES = 5
 RECOVERY_KEYFRAME_HOLDOFF_FRAMES = 8
+UNSTABLE_TRACKING_FRAME_LIMIT = 6
+PARALLAX_PROBE_TRIGGER_FRAMES = 18
+PARALLAX_PROBE_RETURN_FRAMES = 8
+PARALLAX_PROBE_MIN_CLEARANCE = 0.65
+PARALLAX_PROBE_DURATION = 0.18
 
 # Stuck detection
 STUCK_POSITION_THRESHOLD = 0.02  # meters — less movement than this = stuck
@@ -71,10 +77,10 @@ INITIAL_SCAN_MIN_KEYFRAMES = 10
 INITIAL_SCAN_MAX_ROUNDS = 5
 STARTUP_MIN_KEYFRAMES = 1
 STARTUP_SETTLE_SECONDS = 1.5
-INITIAL_SCAN_TURN_DURATION = 0.20
+INITIAL_SCAN_TURN_DURATION = 0.24
 INITIAL_SCAN_RECOVERY_REVERSE_DURATION = 0.25
-NAV_TURN_DURATION = 0.22
-STUCK_TURN_DURATION = 0.25
+NAV_TURN_DURATION = 0.26
+STUCK_TURN_DURATION = 0.30
 
 # We divide the frame into three vertical strips for steering decisions
 STRIP_LEFT = (0, FRAME_WIDTH // 3)
@@ -152,6 +158,7 @@ class VisionEngine:
         # PLY export state
         self._splat_dir = splat_dir or self._default_splat_dir()
         self._ply_version = 0
+        self._ply_epoch = int(time.time() * 1000)
         self._last_ply_export = 0.0
         self._send_counter = 0
         self._frame_count = 0
@@ -166,6 +173,9 @@ class VisionEngine:
         self._scan_loss_recovery_reversed = False
         self._resume_initial_scan_after_recovery = False
         self._recovery_stable_frames = 0
+        self._unstable_tracking_count = 0
+        self._pending_probe_return = False
+        self._probe_start_frame = 0
         # depth_scale no longer used — US for distance, SLAM for steering only
 
     @staticmethod
@@ -265,14 +275,23 @@ class VisionEngine:
         await self._stop()
 
     async def _run_turn(self, turn_dir: int, speed: int, duration: float, *, remember: bool = True) -> None:
-        """Pivot turn to avoid stalling on carpet/static friction.
+        """Asymmetric skid turn that resists motor stall on carpet.
 
         `turn_dir` > 0 rotates left, < 0 rotates right.
         """
+        reverse_speed = max(MIN_DUTY, int(speed * 0.85))
         if turn_dir >= 0:
-            left, right = 0, speed
+            left, right = -reverse_speed, speed
         else:
-            left, right = speed, 0
+            left, right = speed, -reverse_speed
+        await self._run_maneuver(left, right, duration, remember=remember)
+
+    async def _run_strong_turn(self, turn_dir: int, speed: int, duration: float, *, remember: bool = True) -> None:
+        """Stronger in-place turn for startup scan where fast coverage matters more."""
+        if turn_dir >= 0:
+            left, right = -speed, speed
+        else:
+            left, right = speed, -speed
         await self._run_maneuver(left, right, duration, remember=remember)
 
     def _inverse_last_maneuver(self, default_duration: float) -> tuple[int, int, float] | None:
@@ -344,6 +363,7 @@ class VisionEngine:
                 "num_points": int(slam_result.num_points),
                 "camera_pose": pose_flat,
                 "pose_valid": bool(slam_result.pose_valid),
+                "ply_epoch": self._ply_epoch,
                 "ply_version": self._ply_version,
             }
 
@@ -478,7 +498,7 @@ class VisionEngine:
 
         self._set_state(State.SCANNING)
         turn_dir = 1
-        await self._run_turn(turn_dir, INITIAL_SCAN_TURN_SPEED, INITIAL_SCAN_TURN_DURATION)
+        await self._run_strong_turn(turn_dir, INITIAL_SCAN_TURN_SPEED, INITIAL_SCAN_TURN_DURATION)
         await asyncio.sleep(0.35)
         self._scan_steps_remaining -= 1
         self._scan_loss_recovery_reversed = False
@@ -535,6 +555,7 @@ class VisionEngine:
             self._lost_count = 0
             self._lost_recovery_reversed = False
             self._recovery_stable_frames = 0
+            self._pending_probe_return = False
             self._slam.suppress_keyframes(RECOVERY_KEYFRAME_HOLDOFF_FRAMES)
             if self._resume_initial_scan_after_recovery and not self._initial_scan_done:
                 if slam_result.num_keyframes < INITIAL_SCAN_MIN_KEYFRAMES or self._scan_steps_remaining > 0:
@@ -556,6 +577,7 @@ class VisionEngine:
             self._lost_count = 0
         self._lost_count += 1
         self._recovery_stable_frames = 0
+        self._pending_probe_return = False
         self._slam.suppress_keyframes(RECOVERY_KEYFRAME_HOLDOFF_FRAMES)
 
         if not self._debug:
@@ -563,7 +585,7 @@ class VisionEngine:
                 log.info("Tracking lost — stopping")
                 self._lost_recovery_reversed = False
                 await self._stop()
-            elif not self._lost_recovery_reversed and self._lost_count >= 3:
+            elif not self._lost_recovery_reversed and self._lost_count >= RECOVERY_UNDO_DELAY_FRAMES:
                 inverse = self._inverse_last_maneuver(RECOVERY_REVERSE_DURATION)
                 if inverse is not None:
                     reverse_left, reverse_right, reverse_duration = inverse
@@ -598,11 +620,26 @@ class VisionEngine:
             return True
 
         if slam_result.tracking_lost:
+            self._unstable_tracking_count = 0
             self._set_phase(ControlPhase.RECOVERING)
             return False
 
         self._lost_count = 0
         self._lost_recovery_reversed = False
+
+        if not getattr(slam_result, "tracking_stable", True):
+            self._unstable_tracking_count += 1
+        else:
+            self._unstable_tracking_count = 0
+
+        if self._unstable_tracking_count >= UNSTABLE_TRACKING_FRAME_LIMIT:
+            log.info(
+                "Tracking unstable for %d frames — switching to recovery",
+                self._unstable_tracking_count,
+            )
+            self._unstable_tracking_count = 0
+            self._set_phase(ControlPhase.RECOVERING)
+            return False
 
         strip_l, strip_c, strip_r = ctx.depth_strips
         us_distance = ctx.us_distance
@@ -663,6 +700,7 @@ class VisionEngine:
 
         if slam_result.new_keyframe:
             self._last_kf_frame = self._frame_count
+            self._pending_probe_return = False
         frames_since_kf = self._frame_count - self._last_kf_frame
         familiarity = min(1.0, frames_since_kf / 50.0)
         top_speed = int(EXPLORE_SPEED + (CRUISE_SPEED - EXPLORE_SPEED) * familiarity)
@@ -675,6 +713,36 @@ class VisionEngine:
             self._set_state(State.AVOIDING)
         else:
             self._set_state(State.CRUISING)
+
+        if (
+            not self._pending_probe_return
+            and frames_since_kf >= PARALLAX_PROBE_TRIGGER_FRAMES
+            and clearance >= PARALLAX_PROBE_MIN_CLEARANCE
+        ):
+            log.info(
+                "Map growth stalled for %d frames — probing forward for parallax",
+                frames_since_kf,
+            )
+            self._set_state(State.CRUISING)
+            await self._run_maneuver(EXPLORE_SPEED, EXPLORE_SPEED, PARALLAX_PROBE_DURATION)
+            self._pending_probe_return = True
+            self._probe_start_frame = self._frame_count
+            await asyncio.sleep(COAST_PAUSE)
+            return True
+
+        if (
+            self._pending_probe_return
+            and (self._frame_count - self._probe_start_frame) >= PARALLAX_PROBE_RETURN_FRAMES
+        ):
+            inverse = self._inverse_last_maneuver(PARALLAX_PROBE_DURATION)
+            if inverse is not None:
+                back_left, back_right, back_duration = inverse
+                log.info("Returning from parallax probe (%d, %d) for %.2fs", back_left, back_right, back_duration)
+                self._set_state(State.BACKING_UP)
+                await self._run_maneuver(back_left, back_right, back_duration, remember=False)
+            self._pending_probe_return = False
+            await asyncio.sleep(COAST_PAUSE)
+            return True
 
         pulse = PULSE_DURATION + 0.10 * familiarity
         await self._run_maneuver(left_speed, right_speed, pulse)

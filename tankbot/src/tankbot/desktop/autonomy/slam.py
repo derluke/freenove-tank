@@ -38,8 +38,8 @@ FRAME_HEIGHT = 480
 # Robot-specific pose plausibility diagnostics. This is not part of upstream
 # MASt3R-SLAM; it helps flag obviously bad tracking updates without directly
 # suppressing mapping/keyframe creation.
-MAX_TRACK_TRANSLATION_STEP_M = 0.40
-MAX_TRACK_ROTATION_STEP_DEG = 45.0
+MAX_TRACK_TRANSLATION_STEP_M = 0.80
+MAX_TRACK_ROTATION_STEP_DEG = 110.0
 
 # Depth strip regions (same as vision.py)
 STRIP_LEFT = (0, FRAME_WIDTH // 3)
@@ -360,7 +360,7 @@ class SplatSLAM:
         self._last_pose_valid = False
         self._last_good_pose = np.eye(4)
         self._suppress_keyframes_until_frame = 0
-        self._keyframe_start_frame = self.WARMUP_FRAMES
+        self._keyframe_start_frame = 2
 
     def suppress_keyframes(self, frame_count: int) -> None:
         """Temporarily block new keyframe creation for a small number of frames."""
