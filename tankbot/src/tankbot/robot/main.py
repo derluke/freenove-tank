@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import fcntl
 import logging
 import signal
 import socket
-import fcntl
 import struct
-from typing import Any
 
 from tankbot.robot.config import RobotConfig
-from tankbot.robot.drivers import Motor, ServoController, Ultrasonic, InfraredSensors, LedStrip, Camera
+from tankbot.robot.drivers import Camera, InfraredSensors, LedStrip, Motor, ServoController, Ultrasonic
 from tankbot.robot.protocol.legacy_tcp import LegacyCmdServer, LegacyVideoServer
 from tankbot.robot.protocol.websocket_api import WebSocketAPI
-from tankbot.shared.protocol import Cmd, CarMode, LedEffect, Message
+from tankbot.shared.protocol import CarMode, Cmd, LedEffect, Message
 
 log = logging.getLogger(__name__)
 
@@ -24,9 +22,7 @@ def _get_ip() -> str:
     """Get wlan0 IP address, falling back to hostname lookup."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        return socket.inet_ntoa(
-            fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", b"wlan0"[:15]))[20:24]
-        )
+        return socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", b"wlan0"[:15]))[20:24])
     except Exception:
         return socket.gethostbyname(socket.gethostname())
 
@@ -118,7 +114,9 @@ class Robot:
         elif cmd_type == "servo":
             self.servo.set_angle(int(msg.get("channel", 0)), int(msg.get("angle", 90)))
         elif cmd_type == "led":
-            self.led.set_by_mask(int(msg.get("mask", 0xF)), int(msg.get("r", 0)), int(msg.get("g", 0)), int(msg.get("b", 0)))
+            self.led.set_by_mask(
+                int(msg.get("mask", 0xF)), int(msg.get("r", 0)), int(msg.get("g", 0)), int(msg.get("b", 0))
+            )
         elif cmd_type == "led_off":
             self.led.off()
         elif cmd_type == "mode":
@@ -191,32 +189,28 @@ class Robot:
 
     async def _telemetry_loop(self) -> None:
         while self._running:
-            distance = await asyncio.get_running_loop().run_in_executor(
-                None, self.ultrasonic.get_distance
-            )
+            distance = await asyncio.get_running_loop().run_in_executor(None, self.ultrasonic.get_distance)
             # Send to legacy clients
             if self.legacy_cmd.has_clients:
                 await self.legacy_cmd.send_to_all(f"CMD_SONIC#{distance:.2f}")
             # Send to WS clients
             if self.ws_api.has_clients:
-                await self.ws_api.broadcast_telemetry({
-                    "type": "telemetry",
-                    "distance": distance,
-                    "mode": self.car_mode.value,
-                    "motor": {"left": self.left_speed, "right": self.right_speed},
-                    "ir": await asyncio.get_running_loop().run_in_executor(
-                        None, self.infrared.read
-                    ),
-                })
+                await self.ws_api.broadcast_telemetry(
+                    {
+                        "type": "telemetry",
+                        "distance": distance,
+                        "mode": self.car_mode.value,
+                        "motor": {"left": self.left_speed, "right": self.right_speed},
+                        "ir": await asyncio.get_running_loop().run_in_executor(None, self.infrared.read),
+                    }
+                )
             await asyncio.sleep(1.0)
 
     async def _car_behavior_loop(self) -> None:
         """Runs built-in autonomous behaviors (sonar avoidance, line following)."""
         while self._running:
             if self.car_mode == CarMode.SONAR:
-                distance = await asyncio.get_running_loop().run_in_executor(
-                    None, self.ultrasonic.get_distance
-                )
+                distance = await asyncio.get_running_loop().run_in_executor(None, self.ultrasonic.get_distance)
                 if distance > 0 and distance < 45:
                     self.motor.set(-1500, -1500)
                     await asyncio.sleep(0.4)
@@ -227,9 +221,7 @@ class Robot:
                 await asyncio.sleep(0.2)
 
             elif self.car_mode == CarMode.INFRARED:
-                ir = await asyncio.get_running_loop().run_in_executor(
-                    None, self.infrared.read
-                )
+                ir = await asyncio.get_running_loop().run_in_executor(None, self.infrared.read)
                 speed_map = {
                     2: (1200, 1200),
                     4: (-1500, 2500),
@@ -260,7 +252,9 @@ class Robot:
 
         log.info(
             "Servers running — cmd:%d  video:%d  ws:%d",
-            self.cfg.cmd_port, self.cfg.video_port, self.cfg.ws_port,
+            self.cfg.cmd_port,
+            self.cfg.video_port,
+            self.cfg.ws_port,
         )
 
         tasks = [
@@ -285,6 +279,7 @@ class Robot:
 
         # Force exit — camera thread can block asyncio from exiting
         import os
+
         os._exit(0)
 
     async def shutdown(self) -> None:

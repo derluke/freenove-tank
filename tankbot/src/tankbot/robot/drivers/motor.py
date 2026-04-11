@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+
 from gpiozero import Motor as GpioMotor
 
 from tankbot.shared.protocol import clamp_duty
@@ -21,7 +22,7 @@ log = logging.getLogger(__name__)
 _MAX_DUTY = 4096  # divisor to normalise to 0..1
 
 # Ramping config
-_RAMP_STEP = 400       # duty units per tick
+_RAMP_STEP = 400  # duty units per tick
 _RAMP_INTERVAL = 0.02  # seconds between ramp ticks (~50 Hz)
 
 

@@ -8,10 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import struct
-from typing import Callable, Awaitable
+from collections.abc import Awaitable, Callable
 
-from tankbot.shared.protocol import LEGACY_CMD_PORT, LEGACY_VIDEO_PORT, LEGACY_FRAME_HEADER
+from tankbot.shared.protocol import LEGACY_CMD_PORT, LEGACY_FRAME_HEADER, LEGACY_VIDEO_PORT
 
 log = logging.getLogger(__name__)
 

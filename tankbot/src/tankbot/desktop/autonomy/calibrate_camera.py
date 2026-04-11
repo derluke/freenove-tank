@@ -74,7 +74,9 @@ def _detect_checkerboard(gray: np.ndarray, pattern_size: tuple[int, int]) -> tup
     return True, refined.astype(np.float32)
 
 
-def _draw_overlay(frame_bgr: np.ndarray, pattern_size: tuple[int, int], found: bool, corners: np.ndarray | None) -> np.ndarray:
+def _draw_overlay(
+    frame_bgr: np.ndarray, pattern_size: tuple[int, int], found: bool, corners: np.ndarray | None
+) -> np.ndarray:
     overlay = frame_bgr.copy()
     if found and corners is not None:
         cv2.drawChessboardCorners(overlay, pattern_size, corners, found)
@@ -98,7 +100,9 @@ def _draw_overlay(frame_bgr: np.ndarray, pattern_size: tuple[int, int], found: b
     return overlay
 
 
-def _write_calibration_yaml(path: Path, width: int, height: int, camera_matrix: np.ndarray, dist_coeffs: np.ndarray) -> None:
+def _write_calibration_yaml(
+    path: Path, width: int, height: int, camera_matrix: np.ndarray, dist_coeffs: np.ndarray
+) -> None:
     fx = float(camera_matrix[0, 0])
     fy = float(camera_matrix[1, 1])
     cx = float(camera_matrix[0, 2])

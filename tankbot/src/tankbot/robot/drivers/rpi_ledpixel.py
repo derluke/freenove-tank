@@ -1,5 +1,7 @@
 import time
+
 from rpi_ws281x import Adafruit_NeoPixel, Color
+
 
 class Freenove_RPI_WS281X:
     def __init__(self, led_count=4, bright=255, sequence="RGB"):
@@ -36,7 +38,7 @@ class Freenove_RPI_WS281X:
     def set_led_type(self, rgb_type):
         # Set the RGB sequence type for the LEDs
         try:
-            led_type = ['RGB', 'RBG', 'GRB', 'GBR', 'BRG', 'BGR']
+            led_type = ["RGB", "RBG", "GRB", "GBR", "BRG", "BGR"]
             led_type_offset = [0x06, 0x09, 0x12, 0x21, 0x18, 0x24]
             index = led_type.index(rgb_type)
             self.led_red_offset = (led_type_offset[index] >> 4) & 0x03
@@ -110,7 +112,9 @@ class Freenove_RPI_WS281X:
     def show(self):
         # Update the LED strip with the current color data
         for i in range(self.get_led_count()):
-            self.strip.setPixelColor(i, Color(self.led_color[i * 3], self.led_color[i * 3 + 1], self.led_color[i * 3 + 2]))
+            self.strip.setPixelColor(
+                i, Color(self.led_color[i * 3], self.led_color[i * 3 + 1], self.led_color[i * 3 + 2])
+            )
         self.strip.show()
 
     def wheel(self, pos):
@@ -158,9 +162,10 @@ class Freenove_RPI_WS281X:
             b = rgb_max - rgb_adj
         return [r, g, b]
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     import time
-    import os
+
     led = Freenove_RPI_WS281X(4, 255, "RGB")
 
     try:

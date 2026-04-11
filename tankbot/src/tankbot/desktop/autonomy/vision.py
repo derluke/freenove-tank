@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import asyncio
 import csv
-import math
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -41,8 +41,8 @@ FRAME_WIDTH = 640
 FRAME_HEIGHT = 480
 
 # Speeds (duty values, max 4095) — calibrated from human driving
-EXPLORE_SPEED = 1800     # slightly slower in autonomy so SLAM can keep up
-CRUISE_SPEED = 1850      # keep forward exploration deliberate, not twitch-fast
+EXPLORE_SPEED = 1800  # slightly slower in autonomy so SLAM can keep up
+CRUISE_SPEED = 1850  # keep forward exploration deliberate, not twitch-fast
 TURN_SPEED = 1500
 INITIAL_SCAN_TURN_SPEED = 1500
 INITIAL_SCAN_RIGHT_TURN_SPEED = 1700
@@ -52,8 +52,8 @@ RECOVERY_TURN_SPEED = 1500
 MIN_DUTY = 1500
 
 # Pulse-and-coast: short burst then stop to keep speed low
-PULSE_DURATION = 0.20   # shorter forward pulses to give SLAM time to settle
-COAST_PAUSE = 0.08      # seconds of coasting (motors off) between pulses
+PULSE_DURATION = 0.20  # shorter forward pulses to give SLAM time to settle
+COAST_PAUSE = 0.08  # seconds of coasting (motors off) between pulses
 AVOIDANCE_BACKUP_DURATION = 0.10
 RECOVERY_REVERSE_DURATION = 0.30
 RECOVERY_RETREAT_DURATION = 0.35
@@ -79,18 +79,18 @@ PARALLAX_PROBE_DURATION = 0.18
 
 # Stuck detection
 STUCK_POSITION_THRESHOLD = 0.02  # meters — less movement than this = stuck
-STUCK_FRAME_LIMIT = 15           # consecutive "no movement" frames before declaring stuck
+STUCK_FRAME_LIMIT = 15  # consecutive "no movement" frames before declaring stuck
 
 # Ultrasonic thresholds in CM — calibrated from human driving recording
-US_STOP = 40              # closer than 40 cm → turn away (human never went below 46cm)
-US_CLEAR = 100            # farther than 1m → full confidence
-SLAM_FRONT_STOP = 0.45    # hard stop if SLAM center strip says obstacle is too close
-SLAM_FRONT_SLOW = 0.80    # start slowing before the hard stop
+US_STOP = 40  # closer than 40 cm → turn away (human never went below 46cm)
+US_CLEAR = 100  # farther than 1m → full confidence
+SLAM_FRONT_STOP = 0.45  # hard stop if SLAM center strip says obstacle is too close
+SLAM_FRONT_SLOW = 0.80  # start slowing before the hard stop
 RECOVERY_RETREAT_US_NEAR = 45
 RECOVERY_RETREAT_SLAM_NEAR = 0.75
 
 # Initial scan: rotate in place to build panoramic map before moving
-INITIAL_SCAN_STEPS = 12   # number of turn pulses at startup
+INITIAL_SCAN_STEPS = 12  # number of turn pulses at startup
 INITIAL_SCAN_EXTRA_STEPS = 4
 INITIAL_SCAN_MIN_KEYFRAMES = 10
 INITIAL_SCAN_MAX_ROUNDS = 5
@@ -120,6 +120,8 @@ MIN_STATE_DURATION = {
 
 # SLAM
 PLY_EXPORT_INTERVAL = 5.0  # seconds between PLY exports
+
+
 class State(str, Enum):
     SCANNING = "scanning"
     CRUISING = "cruising"
@@ -147,9 +149,9 @@ FORCE_DEBUG = False
 
 
 class VisionEngine:
-    def __init__(self, robot_url: str = "", debug: bool = False,
-                 splat_dir: str = "", record: bool = False,
-                 calib_path: str = "") -> None:
+    def __init__(
+        self, robot_url: str = "", debug: bool = False, splat_dir: str = "", record: bool = False, calib_path: str = ""
+    ) -> None:
         debug = debug or FORCE_DEBUG
         self._record = record
         self._record_file = None
@@ -197,7 +199,7 @@ class VisionEngine:
         self._frame_count = 0
         self._last_nav_pose = None
         self._stuck_count = 0
-        self._last_kf_frame = 0    # frame count when last keyframe was added
+        self._last_kf_frame = 0  # frame count when last keyframe was added
         self._initial_scan_done = False
         self._scan_steps_remaining = 0
         self._scan_rounds = 0
@@ -451,11 +453,7 @@ class VisionEngine:
         return (0, 140, 60, 0xF)
 
     def _startup_ready(self, slam_result) -> bool:
-        if (
-            slam_result is None
-            or slam_result.tracking_lost
-            or slam_result.num_keyframes < STARTUP_MIN_KEYFRAMES
-        ):
+        if slam_result is None or slam_result.tracking_lost or slam_result.num_keyframes < STARTUP_MIN_KEYFRAMES:
             self._startup_ready_since = None
             return False
 
@@ -467,9 +465,9 @@ class VisionEngine:
 
         return (now - self._startup_ready_since) >= STARTUP_SETTLE_SECONDS
 
-    async def _send_vision_status(self, us_distance: float,
-                                  depth_strips: tuple[float, float, float],
-                                  slam_result) -> None:
+    async def _send_vision_status(
+        self, us_distance: float, depth_strips: tuple[float, float, float], slam_result
+    ) -> None:
         self._send_counter += 1
         plan = self._planner.snapshot(phase=self._phase.value)
 
@@ -513,7 +511,8 @@ class VisionEngine:
                     "scan_round": int(self._scan_rounds),
                     "planner_target_heading_deg": (
                         round(math.degrees(self._last_planner_command.target_heading), 1)
-                        if self._last_planner_command is not None and self._last_planner_command.target_heading is not None
+                        if self._last_planner_command is not None
+                        and self._last_planner_command.target_heading is not None
                         else None
                     ),
                     "planner_target_cell": (
@@ -526,8 +525,9 @@ class VisionEngine:
         except Exception:
             # Log full message for debugging JSON serialization issues
             if self._send_counter % 30 == 0:
-                log.exception("Failed to send vision status, slam_data keys: %s",
-                              list(slam_data.keys()) if slam_data else None)
+                log.exception(
+                    "Failed to send vision status, slam_data keys: %s", list(slam_data.keys()) if slam_data else None
+                )
 
     # ------------------------------------------------------------------
     # Recording
@@ -539,14 +539,24 @@ class VisionEngine:
         os.makedirs("recordings", exist_ok=True)
         self._record_file = open(path, "w", newline="")
         self._record_writer = csv.writer(self._record_file)
-        self._record_writer.writerow([
-            "timestamp", "frame_idx",
-            "motor_left", "motor_right",
-            "us_distance",
-            "slam_strip_l", "slam_strip_c", "slam_strip_r",
-            "pose_x", "pose_y", "pose_z", "pose_rot_deg",
-            "tracking_lost", "num_points",
-        ])
+        self._record_writer.writerow(
+            [
+                "timestamp",
+                "frame_idx",
+                "motor_left",
+                "motor_right",
+                "us_distance",
+                "slam_strip_l",
+                "slam_strip_c",
+                "slam_strip_r",
+                "pose_x",
+                "pose_y",
+                "pose_z",
+                "pose_rot_deg",
+                "tracking_lost",
+                "num_points",
+            ]
+        )
         log.info("Recording to %s", path)
 
     def _init_intent_trace(self) -> None:
@@ -555,43 +565,45 @@ class VisionEngine:
         os.makedirs("recordings", exist_ok=True)
         self._intent_trace_file = open(path, "w", newline="")
         self._intent_trace_writer = csv.writer(self._intent_trace_file)
-        self._intent_trace_writer.writerow([
-            "timestamp",
-            "frame_idx",
-            "phase",
-            "state",
-            "behavior",
-            "status_detail",
-            "planner_mode",
-            "planner_reason",
-            "planner_target_cell",
-            "planner_target_heading_deg",
-            "frontier_count",
-            "coverage_ratio",
-            "pose_valid",
-            "pose_x",
-            "pose_y",
-            "pose_z",
-            "pose_heading_deg",
-            "tracking_lost",
-            "tracking_stable",
-            "lost_count",
-            "recovery_stable_frames",
-            "unstable_tracking_count",
-            "scan_round",
-            "scan_steps_remaining",
-            "num_keyframes",
-            "num_points",
-            "us_distance_cm",
-            "depth_left_m",
-            "depth_center_m",
-            "depth_right_m",
-            "issued_left",
-            "issued_right",
-            "issued_duration_s",
-            "motor_left",
-            "motor_right",
-        ])
+        self._intent_trace_writer.writerow(
+            [
+                "timestamp",
+                "frame_idx",
+                "phase",
+                "state",
+                "behavior",
+                "status_detail",
+                "planner_mode",
+                "planner_reason",
+                "planner_target_cell",
+                "planner_target_heading_deg",
+                "frontier_count",
+                "coverage_ratio",
+                "pose_valid",
+                "pose_x",
+                "pose_y",
+                "pose_z",
+                "pose_heading_deg",
+                "tracking_lost",
+                "tracking_stable",
+                "lost_count",
+                "recovery_stable_frames",
+                "unstable_tracking_count",
+                "scan_round",
+                "scan_steps_remaining",
+                "num_keyframes",
+                "num_points",
+                "us_distance_cm",
+                "depth_left_m",
+                "depth_center_m",
+                "depth_right_m",
+                "issued_left",
+                "issued_right",
+                "issued_duration_s",
+                "motor_left",
+                "motor_right",
+            ]
+        )
         log.info("Intent trace to %s", path)
 
     def _record_intent_trace(self, ctx: FrameContext, planner_cmd) -> None:
@@ -622,51 +634,53 @@ class VisionEngine:
             issued_left = self._last_issued_command[0]
             issued_right = self._last_issued_command[1]
             issued_duration = f"{self._last_issued_command[2]:.2f}"
-        self._intent_trace_writer.writerow([
-            f"{time.monotonic():.3f}",
-            self._frame_count,
-            self._phase.value,
-            self._state.value,
-            behavior,
-            status_detail,
-            planner_cmd.mode.value if planner_cmd is not None else "",
-            planner_cmd.reason if planner_cmd is not None else "",
-            target_cell,
-            target_heading,
-            self._planner_snapshot.frontier_count,
-            f"{self._planner_snapshot.coverage_ratio:.4f}",
-            1 if pose_valid else 0,
-            pose_x,
-            pose_y,
-            pose_z,
-            pose_heading,
-            1 if (slam_result and slam_result.tracking_lost) else 0,
-            1 if (slam_result and getattr(slam_result, 'tracking_stable', True)) else 0,
-            int(getattr(self, "_lost_count", 0)),
-            int(getattr(self, "_recovery_stable_frames", 0)),
-            int(getattr(self, "_unstable_tracking_count", 0)),
-            int(self._scan_rounds),
-            int(self._scan_steps_remaining),
-            int(slam_result.num_keyframes) if slam_result is not None else 0,
-            int(slam_result.num_points) if slam_result is not None else 0,
-            f"{ctx.us_distance:.1f}",
-            f"{ctx.depth_strips[0]:.3f}",
-            f"{ctx.depth_strips[1]:.3f}",
-            f"{ctx.depth_strips[2]:.3f}",
-            issued_left,
-            issued_right,
-            issued_duration,
-            self._current_motor[0],
-            self._current_motor[1],
-        ])
+        self._intent_trace_writer.writerow(
+            [
+                f"{time.monotonic():.3f}",
+                self._frame_count,
+                self._phase.value,
+                self._state.value,
+                behavior,
+                status_detail,
+                planner_cmd.mode.value if planner_cmd is not None else "",
+                planner_cmd.reason if planner_cmd is not None else "",
+                target_cell,
+                target_heading,
+                self._planner_snapshot.frontier_count,
+                f"{self._planner_snapshot.coverage_ratio:.4f}",
+                1 if pose_valid else 0,
+                pose_x,
+                pose_y,
+                pose_z,
+                pose_heading,
+                1 if (slam_result and slam_result.tracking_lost) else 0,
+                1 if (slam_result and getattr(slam_result, "tracking_stable", True)) else 0,
+                int(getattr(self, "_lost_count", 0)),
+                int(getattr(self, "_recovery_stable_frames", 0)),
+                int(getattr(self, "_unstable_tracking_count", 0)),
+                int(self._scan_rounds),
+                int(self._scan_steps_remaining),
+                int(slam_result.num_keyframes) if slam_result is not None else 0,
+                int(slam_result.num_points) if slam_result is not None else 0,
+                f"{ctx.us_distance:.1f}",
+                f"{ctx.depth_strips[0]:.3f}",
+                f"{ctx.depth_strips[1]:.3f}",
+                f"{ctx.depth_strips[2]:.3f}",
+                issued_left,
+                issued_right,
+                issued_duration,
+                self._current_motor[0],
+                self._current_motor[1],
+            ]
+        )
         self._intent_trace_file.flush()
 
-    def _record_frame(self, slam_result, us_distance: float,
-                      strips: tuple, motor_left: int, motor_right: int) -> None:
+    def _record_frame(self, slam_result, us_distance: float, strips: tuple, motor_left: int, motor_right: int) -> None:
         """Record one frame of driving data."""
         if self._record_writer is None:
             return
         import math
+
         pose = slam_result.camera_pose if slam_result else None
         if pose is not None:
             tx, ty, tz = pose[0, 3], pose[1, 3], pose[2, 3]
@@ -675,15 +689,24 @@ class VisionEngine:
         else:
             tx = ty = tz = rot = 0.0
 
-        self._record_writer.writerow([
-            f"{time.monotonic():.3f}", self._frame_count,
-            motor_left, motor_right,
-            f"{us_distance:.1f}",
-            f"{strips[0]:.3f}", f"{strips[1]:.3f}", f"{strips[2]:.3f}",
-            f"{tx:.4f}", f"{ty:.4f}", f"{tz:.4f}", f"{rot:.1f}",
-            1 if (slam_result and slam_result.tracking_lost) else 0,
-            slam_result.num_points if slam_result else 0,
-        ])
+        self._record_writer.writerow(
+            [
+                f"{time.monotonic():.3f}",
+                self._frame_count,
+                motor_left,
+                motor_right,
+                f"{us_distance:.1f}",
+                f"{strips[0]:.3f}",
+                f"{strips[1]:.3f}",
+                f"{strips[2]:.3f}",
+                f"{tx:.4f}",
+                f"{ty:.4f}",
+                f"{tz:.4f}",
+                f"{rot:.1f}",
+                1 if (slam_result and slam_result.tracking_lost) else 0,
+                slam_result.num_points if slam_result else 0,
+            ]
+        )
         self._record_file.flush()
 
     def _build_frame_context(self, analysis: dict, us_distance: float) -> FrameContext:
@@ -732,7 +755,9 @@ class VisionEngine:
                     unwind_left, unwind_right, unwind_duration = inverse
                     log.info(
                         "Initial scan lost tracking — undoing last turn (%d, %d) for %.2fs",
-                        unwind_left, unwind_right, unwind_duration,
+                        unwind_left,
+                        unwind_right,
+                        unwind_duration,
                     )
                     await self._run_maneuver(
                         unwind_left,
@@ -762,10 +787,7 @@ class VisionEngine:
 
         if self._scan_steps_remaining <= 0:
             num_keyframes = ctx.slam_result.num_keyframes if ctx.slam_result is not None else 0
-            if (
-                num_keyframes < INITIAL_SCAN_MIN_KEYFRAMES
-                and self._scan_rounds < INITIAL_SCAN_MAX_ROUNDS
-            ):
+            if num_keyframes < INITIAL_SCAN_MIN_KEYFRAMES and self._scan_rounds < INITIAL_SCAN_MAX_ROUNDS:
                 self._scan_steps_remaining = INITIAL_SCAN_EXTRA_STEPS
                 self._scan_rounds += 1
                 self._scan_step_index = 0
@@ -849,19 +871,22 @@ class VisionEngine:
                 if self._last_planner_command_mode == PlannerMode.APPROACH_FRONTIER
                 else RECOVERY_UNDO_DELAY_FRAMES
             ):
-                near_wall = (
-                    (0 < ctx.us_distance < RECOVERY_RETREAT_US_NEAR)
-                    or (0 < ctx.depth_strips[1] < RECOVERY_RETREAT_SLAM_NEAR)
+                near_wall = (0 < ctx.us_distance < RECOVERY_RETREAT_US_NEAR) or (
+                    0 < ctx.depth_strips[1] < RECOVERY_RETREAT_SLAM_NEAR
                 )
                 inverse = (
                     self._retreat_forward_maneuver(RECOVERY_RETREAT_DURATION)
-                    if near_wall and self._recovery_retreat_count < RECOVERY_MAX_RETREATS else None
+                    if near_wall and self._recovery_retreat_count < RECOVERY_MAX_RETREATS
+                    else None
                 )
                 if inverse is not None:
                     reverse_left, reverse_right, reverse_duration = inverse
                     log.info(
                         "Tracking lost near wall (%d frames) — retreating along last forward path (%d, %d) for %.2fs",
-                        self._lost_count, reverse_left, reverse_right, reverse_duration,
+                        self._lost_count,
+                        reverse_left,
+                        reverse_right,
+                        reverse_duration,
                     )
                     self._set_state(State.BACKING_UP)
                     await self._run_maneuver(
@@ -878,7 +903,10 @@ class VisionEngine:
                         reverse_left, reverse_right, reverse_duration = inverse
                         log.info(
                             "Tracking lost (%d frames) — undoing last maneuver (%d, %d) for %.2fs",
-                            self._lost_count, reverse_left, reverse_right, reverse_duration,
+                            self._lost_count,
+                            reverse_left,
+                            reverse_right,
+                            reverse_duration,
                         )
                         self._set_state(State.BACKING_UP)
                         await self._run_maneuver(
@@ -888,13 +916,19 @@ class VisionEngine:
                             remember=False,
                         )
                         self._lost_recovery_reversed = True
-            elif self._lost_count % RECOVERY_RETRY_RETREAT_INTERVAL == 0 and self._recovery_retreat_count < RECOVERY_MAX_RETREATS:
+            elif (
+                self._lost_count % RECOVERY_RETRY_RETREAT_INTERVAL == 0
+                and self._recovery_retreat_count < RECOVERY_MAX_RETREATS
+            ):
                 inverse = self._retreat_forward_maneuver(RECOVERY_RETREAT_DURATION)
                 if inverse is not None:
                     reverse_left, reverse_right, reverse_duration = inverse
                     log.info(
                         "Tracking still lost (%d frames) — widening context with another retreat (%d, %d) for %.2fs",
-                        self._lost_count, reverse_left, reverse_right, reverse_duration,
+                        self._lost_count,
+                        reverse_left,
+                        reverse_right,
+                        reverse_duration,
                     )
                     self._set_state(State.BACKING_UP)
                     await self._run_maneuver(
@@ -1006,10 +1040,7 @@ class VisionEngine:
         import numpy as np
 
         front_clearance_m = strip_c
-        if (
-            (0 < us_distance < US_STOP)
-            or (front_clearance_m > 0 and front_clearance_m < SLAM_FRONT_STOP)
-        ):
+        if (0 < us_distance < US_STOP) or (front_clearance_m > 0 and front_clearance_m < SLAM_FRONT_STOP):
             self._set_state(State.SCANNING)
             await self._stop()
             if strip_l > strip_r:
@@ -1024,7 +1055,9 @@ class VisionEngine:
         else:
             clearance = 0.7
         if front_clearance_m > 0:
-            slam_clearance = max(0.0, min(1.0, (front_clearance_m - SLAM_FRONT_STOP) / (SLAM_FRONT_SLOW - SLAM_FRONT_STOP)))
+            slam_clearance = max(
+                0.0, min(1.0, (front_clearance_m - SLAM_FRONT_STOP) / (SLAM_FRONT_SLOW - SLAM_FRONT_STOP))
+            )
             clearance = min(clearance, slam_clearance)
 
         if slam_result.new_keyframe:
@@ -1050,7 +1083,11 @@ class VisionEngine:
             await asyncio.sleep(COAST_PAUSE)
             return True
 
-        target_heading = planner_cmd.target_heading if planner_cmd.target_heading is not None else self._heading_from_pose(slam_result.camera_pose)
+        target_heading = (
+            planner_cmd.target_heading
+            if planner_cmd.target_heading is not None
+            else self._heading_from_pose(slam_result.camera_pose)
+        )
         heading_error = self._wrap_angle(target_heading - self._heading_from_pose(slam_result.camera_pose))
 
         if planner_cmd.mode == PlannerMode.TURN:
@@ -1168,8 +1205,11 @@ class VisionEngine:
             if self._record and self._record_writer:
                 motor = self._latest_telemetry.get("motor", {})
                 self._record_frame(
-                    slam_result, us_distance, raw_depth_strips,
-                    motor.get("left", 0), motor.get("right", 0),
+                    slam_result,
+                    us_distance,
+                    raw_depth_strips,
+                    motor.get("left", 0),
+                    motor.get("right", 0),
                 )
 
             # Export PLY periodically (in executor since it touches disk)
@@ -1245,10 +1285,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Tank robot autonomous vision (MASt3R-SLAM)")
     parser.add_argument("--robot", default="", help="Robot WebSocket URL (or set ROBOT_URL env var)")
     parser.add_argument("--splat-dir", default="", help="Directory for PLY export (default: Phoenix static assets)")
-    parser.add_argument("--debug", action="store_true",
-                        help="Debug mode: run SLAM but send no motor commands")
-    parser.add_argument("--record", action="store_true",
-                        help="Record driving data (use with --debug while driving manually)")
+    parser.add_argument("--debug", action="store_true", help="Debug mode: run SLAM but send no motor commands")
+    parser.add_argument(
+        "--record", action="store_true", help="Record driving data (use with --debug while driving manually)"
+    )
     parser.add_argument(
         "--calib",
         default="",

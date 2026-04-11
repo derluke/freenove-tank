@@ -9,6 +9,7 @@ Returns a 3-bit value (0-7) representing the combined sensor state.
 from __future__ import annotations
 
 import logging
+
 from gpiozero import LineSensor
 
 log = logging.getLogger(__name__)

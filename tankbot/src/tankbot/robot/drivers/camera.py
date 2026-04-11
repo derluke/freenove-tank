@@ -29,19 +29,21 @@ class _StreamBuffer(io.BufferedIOBase):
 
 class Camera:
     def __init__(self, stream_size: tuple[int, int] = (400, 300), hflip: bool = False, vflip: bool = False) -> None:
-        from picamera2 import Picamera2
         from libcamera import Transform
+        from picamera2 import Picamera2
 
         self._cam = Picamera2()
         transform = Transform(hflip=int(hflip), vflip=int(vflip))
 
         preview_cfg = self._cam.create_preview_configuration(
-            main={"size": (640, 480)}, transform=transform,
+            main={"size": (640, 480)},
+            transform=transform,
         )
         self._cam.configure(preview_cfg)
 
         self._stream_cfg = self._cam.create_video_configuration(
-            main={"size": stream_size}, transform=transform,
+            main={"size": stream_size},
+            transform=transform,
         )
         self._buffer = _StreamBuffer()
         self._streaming = False

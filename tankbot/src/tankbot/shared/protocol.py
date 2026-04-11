@@ -14,9 +14,7 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass, field
-from enum import Enum, auto
-from typing import Any
-
+from enum import Enum
 
 # ---------------------------------------------------------------------------
 # Legacy protocol constants (must match Freenove Android app)
@@ -29,6 +27,7 @@ LEGACY_FRAME_HEADER = struct.Struct("<I")  # 4-byte little-endian uint32
 
 class Cmd(str, Enum):
     """Command identifiers — values must match the Android app exactly."""
+
     MOTOR = "CMD_MOTOR"
     SERVO = "CMD_SERVO"
     LED = "CMD_LED"
@@ -101,8 +100,8 @@ SERVO_LIMITS: dict[int, tuple[int, int]] = {
 
 # Default servo positions
 SERVO_DEFAULTS: dict[int, int] = {
-    0: 130,   # grabber slightly open
-    1: 140,   # arm up
+    0: 130,  # grabber slightly open
+    1: 140,  # arm up
 }
 
 

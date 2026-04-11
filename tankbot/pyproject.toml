@@ -20,7 +20,9 @@ robot = [
 ]
 # Install on the desktop
 desktop = [
+    "accelerate>=1.0",        # transformers device placement helpers
     "einops>=0.8.2",
+    "huggingface_hub>=0.24",  # weight download for depth backends
     "lietorch",
     "natsort>=8.4.0",
     "pyrealsense2>=2.56.5.9235",
@@ -29,8 +31,10 @@ desktop = [
     "numpy>=1.26",
     "Pillow",
     "plyfile>=1.0",          # PLY export for Gaussian Splat maps
+    "timm>=1.0",              # vision backbones used by depth backends
     "torchvision>=0.25.0",
     "tqdm>=4.67.3",
+    "transformers>=4.45",     # AutoModelForDepthEstimation for Phase 0b backends
 ]
 
 [project.scripts]
@@ -39,6 +43,7 @@ tankbot-vision = "tankbot.desktop.autonomy.vision:main"
 tankbot-calibrate-camera = "tankbot.desktop.autonomy.calibrate_camera:main"
 tankbot-record-robot-stream = "tankbot.desktop.autonomy.record_robot_stream:main"
 tankbot-replay-slam-dataset = "tankbot.desktop.autonomy.replay_slam_dataset:main"
+tankbot-benchmark-depth = "tankbot.desktop.autonomy.benchmark_depth:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -104,5 +109,14 @@ module = [
     "mast3r_slam.*",
     "mast3r.*",
     "lietorch.*",
+    "transformers.*",
+    "unidepth.*",
 ]
 ignore_missing_imports = true
+
+[dependency-groups]
+dev = [
+    "mypy>=1.20.0",
+    "pytest>=9.0.3",
+    "ruff>=0.15.10",
+]

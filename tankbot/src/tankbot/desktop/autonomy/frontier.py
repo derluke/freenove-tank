@@ -7,13 +7,12 @@ and emits short-horizon commands toward frontiers or anchor views.
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-import math
 
 import numpy as np
-
 
 GRID_RESOLUTION_M = 0.10
 GRID_SIZE = 240
@@ -236,10 +235,7 @@ class FrontierPlanner:
         unknown_mask = state == 0
         frontier_mask = np.zeros_like(free_mask, dtype=bool)
         frontier_mask[1:-1, 1:-1] = free_mask[1:-1, 1:-1] & (
-            unknown_mask[:-2, 1:-1]
-            | unknown_mask[2:, 1:-1]
-            | unknown_mask[1:-1, :-2]
-            | unknown_mask[1:-1, 2:]
+            unknown_mask[:-2, 1:-1] | unknown_mask[2:, 1:-1] | unknown_mask[1:-1, :-2] | unknown_mask[1:-1, 2:]
         )
 
         visited = np.zeros_like(frontier_mask, dtype=bool)

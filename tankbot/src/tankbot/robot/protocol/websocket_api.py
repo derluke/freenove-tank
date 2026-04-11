@@ -14,8 +14,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Callable, Awaitable, Any
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +43,9 @@ class WebSocketAPI:
         import websockets
 
         self._server = await websockets.serve(
-            self._handle_client, host, port,
+            self._handle_client,
+            host,
+            port,
             ping_interval=None,
             max_size=2**22,
         )

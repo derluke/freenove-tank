@@ -8,7 +8,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Callable, Awaitable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import websockets
 
@@ -18,6 +19,7 @@ log = logging.getLogger(__name__)
 class RobotClient:
     def __init__(self, robot_url: str = "") -> None:
         import os
+
         robot_url = robot_url or os.environ.get("ROBOT_URL", "ws://localhost:9000")
         self._url = robot_url
         self._ws: Any = None

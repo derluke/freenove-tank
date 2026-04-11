@@ -7,10 +7,12 @@ import asyncio
 import contextlib
 import time
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
 
+from tankbot.desktop.autonomy.dataset import DatasetWriter, iter_frame_records
 from tankbot.desktop.autonomy.robot_client import RobotClient
 
 
@@ -21,22 +23,43 @@ class FrameRecorder:
         self._max_frames = max_frames
         self._duration_s = duration_s
         self._latest_frame: bytes | None = None
+        self._latest_frame_monotonic = 0.0
+        self._latest_frame_wall = 0.0
         self._written = 0
         self._start_time = 0.0
+        self._dataset = DatasetWriter(
+            output_dir,
+            source="record_robot_stream",
+            cli_args={
+                "robot_url": robot_url,
+                "max_frames": max_frames,
+                "duration_s": duration_s,
+            },
+        )
+        self._next_frame_index = self._discover_next_frame_index(output_dir)
 
     async def _on_frame(self, jpeg: bytes) -> None:
         self._latest_frame = jpeg
+        self._latest_frame_monotonic = time.monotonic()
+        self._latest_frame_wall = time.time()
+
+    async def _on_telemetry(self, data: dict[str, Any]) -> None:
+        self._dataset.write_telemetry(
+            data,
+            t_monotonic=time.monotonic(),
+            t_wall=time.time(),
+        )
 
     async def connect(self) -> None:
+        self._dataset.open()
         self._client.on_frame(self._on_frame)
-        self._client.on_telemetry(lambda _: None)
+        self._client.on_telemetry(self._on_telemetry)
         await self._client.connect()
 
     async def listen(self) -> None:
         await self._client.listen()
 
     async def record(self) -> int:
-        self._output_dir.mkdir(parents=True, exist_ok=True)
         self._start_time = time.monotonic()
         last_jpeg: bytes | None = None
 
@@ -56,15 +79,31 @@ class FrameRecorder:
                 await asyncio.sleep(0.01)
                 continue
 
-            frame_path = self._output_dir / f"{self._written:06d}.png"
-            cv2.imwrite(str(frame_path), frame)
+            frame_path = self._output_dir / f"{self._next_frame_index:06d}.png"
+            if not cv2.imwrite(str(frame_path), frame):
+                await asyncio.sleep(0.01)
+                continue
+            self._dataset.write_frame(
+                frame_index=self._next_frame_index,
+                t_monotonic=self._latest_frame_monotonic,
+                t_wall=self._latest_frame_wall,
+            )
             self._written += 1
+            self._next_frame_index += 1
             last_jpeg = jpeg
 
         return self._written
 
     async def close(self) -> None:
+        self._dataset.close()
         await self._client.close()
+
+    @staticmethod
+    def _discover_next_frame_index(output_dir: Path) -> int:
+        next_index = 0
+        for frame in iter_frame_records(output_dir):
+            next_index = max(next_index, frame.index + 1)
+        return next_index
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -90,7 +129,9 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Record raw robot webcam frames to a folder.")
+    parser = argparse.ArgumentParser(
+        description="Record robot frames plus raw telemetry to a streaming dataset folder."
+    )
     parser.add_argument("--robot", default="ws://localhost:9000")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-frames", type=int, default=600)

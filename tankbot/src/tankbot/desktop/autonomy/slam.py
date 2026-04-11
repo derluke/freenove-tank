@@ -45,15 +45,15 @@ STRIP_RIGHT = (2 * FRAME_WIDTH // 3, FRAME_WIDTH)
 class SLAMResult:
     """Output of a single SLAM frame processing step."""
 
-    depth_map: np.ndarray        # H×W float32 meters (at model resolution)
-    camera_pose: np.ndarray      # 4×4 float64 (world-from-camera)
-    pose_valid: bool             # True when camera_pose is suitable for visualization/control
-    tracking_quality: float      # 0..1
-    num_points: int              # total points in map
-    num_keyframes: int = 0       # total keyframes currently stored
+    depth_map: np.ndarray  # H×W float32 meters (at model resolution)
+    camera_pose: np.ndarray  # 4×4 float64 (world-from-camera)
+    pose_valid: bool  # True when camera_pose is suitable for visualization/control
+    tracking_quality: float  # 0..1
+    num_points: int  # total points in map
+    num_keyframes: int = 0  # total keyframes currently stored
     tracking_lost: bool = False  # True when tracker requests relocalization
-    new_keyframe: bool = False   # True when a new keyframe was just added
-    tracking_stable: bool = True # False when the latest tracked step looks implausible
+    new_keyframe: bool = False  # True when a new keyframe was just added
+    tracking_stable: bool = True  # False when the latest tracked step looks implausible
     planning_points: np.ndarray | None = None  # Nx3 world points sampled from current frame
 
 
@@ -78,9 +78,7 @@ def _find_mast3r_root() -> Path:
     for p in candidates:
         if (p / "main.py").exists():
             return p
-    raise ImportError(
-        "MASt3R-SLAM not found. Run `task slam:setup` to install it."
-    )
+    raise ImportError("MASt3R-SLAM not found. Run `task slam:setup` to install it.")
 
 
 def _ensure_on_path() -> Path:
@@ -185,16 +183,19 @@ def _truncate_factor_graph(factor_graph, edge_count: int) -> None:
 
 def _run_backend_wrapper(cfg, model, states, keyframes, K, mast3r_root):
     """Backend process entry point — runs global optimization + loop closure."""
-    import os, sys, traceback
+    import os
+    import sys
+    import traceback
+
     os.chdir(str(mast3r_root))  # Checkpoints use relative paths
     if str(mast3r_root) not in sys.path:
         sys.path.insert(0, str(mast3r_root))
 
     try:
-        from mast3r_slam.config import set_global_config, config
+        from mast3r_slam.config import config, set_global_config
+        from mast3r_slam.frame import Mode
         from mast3r_slam.global_opt import FactorGraph
         from mast3r_slam.mast3r_utils import load_retriever
-        from mast3r_slam.frame import Mode
 
         set_global_config(cfg)
         device = keyframes.device
@@ -220,9 +221,7 @@ def _run_backend_wrapper(cfg, model, states, keyframes, K, mast3r_root):
             if pending_reloc == 0:
                 time.sleep(0.01)
                 continue
-            success = _attempt_relocalization(
-                states, keyframes, factor_graph, retrieval_database, config
-            )
+            success = _attempt_relocalization(states, keyframes, factor_graph, retrieval_database, config)
             if success:
                 states.set_mode(Mode.TRACKING)
             states.dequeue_reloc()
@@ -246,7 +245,8 @@ def _run_backend_wrapper(cfg, model, states, keyframes, K, mast3r_root):
 
             frame = keyframes[idx]
             retrieval_inds = retrieval_database.update(
-                frame, add_after_query=True,
+                frame,
+                add_after_query=True,
                 k=config["retrieval"]["k"],
                 min_thresh=config["retrieval"]["min_thresh"],
             )
@@ -261,11 +261,9 @@ def _run_backend_wrapper(cfg, model, states, keyframes, K, mast3r_root):
             frame_idx = [idx] * len(kf_idx)
 
             if kf_idx:
-                factor_graph.add_factors(
-                    kf_idx, frame_idx, config["local_opt"]["min_match_frac"]
-                )
+                factor_graph.add_factors(kf_idx, frame_idx, config["local_opt"]["min_match_frac"])
 
-            n_factors_after = len(factor_graph.ii) if hasattr(factor_graph, 'ii') else 0
+            n_factors_after = len(factor_graph.ii) if hasattr(factor_graph, "ii") else 0
 
             with states.lock:
                 states.edges_ii[:] = factor_graph.ii.cpu().tolist()
@@ -279,8 +277,7 @@ def _run_backend_wrapper(cfg, model, states, keyframes, K, mast3r_root):
                 solve_mode = "rays"
 
             print(
-                f"[Backend] KF {idx}: {n_factors_after} factors, retrieval={retrieval_inds} "
-                f"(solve={solve_mode})",
+                f"[Backend] KF {idx}: {n_factors_after} factors, retrieval={retrieval_inds} (solve={solve_mode})",
                 flush=True,
             )
 
@@ -297,6 +294,7 @@ def _run_backend_wrapper(cfg, model, states, keyframes, K, mast3r_root):
                     states.global_optimizer_tasks.pop(0)
         except Exception as e:
             import traceback
+
             _truncate_factor_graph(factor_graph, n_factors_before)
             print(f"[Backend] ERROR optimizing KF {idx}: {e}", flush=True)
             traceback.print_exc()
@@ -364,9 +362,7 @@ class SplatSLAM:
             if candidate.exists():
                 return candidate.resolve()
 
-        raise FileNotFoundError(
-            f"Calibration file not found: {self._calibration_path}"
-        )
+        raise FileNotFoundError(f"Calibration file not found: {self._calibration_path}")
 
     def _load_calibration(self) -> tuple[Any, torch.Tensor] | tuple[None, None]:
         calib_path = self._resolve_calibration_path()
@@ -393,14 +389,10 @@ class SplatSLAM:
         K_opt, _ = cv2.getOptimalNewCameraMatrix(
             K, distortion, (width, height), 0, (width, height), centerPrincipalPoint=center
         )
-        mapx, mapy = cv2.initUndistortRectifyMap(
-            K, distortion, None, K_opt, (width, height), cv2.CV_32FC1
-        )
+        mapx, mapy = cv2.initUndistortRectifyMap(K, distortion, None, K_opt, (width, height), cv2.CV_32FC1)
 
         dummy = np.zeros((height, width, 3), dtype=np.float32)
-        _, (scale_w, scale_h, half_crop_w, half_crop_h) = resize_img(
-            dummy, self._img_size, return_transformation=True
-        )
+        _, (scale_w, scale_h, half_crop_w, half_crop_h) = resize_img(dummy, self._img_size, return_transformation=True)
         K_frame = K_opt.copy()
         K_frame[0, 0] = K_opt[0, 0] / scale_w
         K_frame[1, 1] = K_opt[1, 1] / scale_h
@@ -417,9 +409,9 @@ class SplatSLAM:
         """Initialize MASt3R-SLAM model and components."""
         self._mast3r_root = _ensure_on_path()
 
-        from mast3r_slam.config import load_config, config
-        from mast3r_slam.mast3r_utils import load_mast3r
+        from mast3r_slam.config import config, load_config
         from mast3r_slam.frame import SharedKeyframes
+        from mast3r_slam.mast3r_utils import load_mast3r
         from mast3r_slam.tracker import FrameTracker
 
         calib_path = self._resolve_calibration_path()
@@ -455,6 +447,7 @@ class SplatSLAM:
 
         # Shared keyframe buffer (needs multiprocessing manager)
         import multiprocessing as mp
+
         self._mp_ctx = mp.get_context("spawn")
         self._mp_manager = self._mp_ctx.Manager()
         self._keyframes = SharedKeyframes(
@@ -470,7 +463,8 @@ class SplatSLAM:
             self._keyframes.set_intrinsics(K)
 
         # Shared states for frontend/backend communication
-        from mast3r_slam.frame import SharedStates, Mode
+        from mast3r_slam.frame import Mode, SharedStates
+
         self._states = SharedStates(
             self._mp_manager,
             h=self._model_h,
@@ -524,9 +518,10 @@ class SplatSLAM:
         self._frame_idx += 1
         t0 = time.monotonic()
 
-        from mast3r_slam.frame import create_frame, Mode
-        from mast3r_slam.mast3r_utils import mast3r_inference_mono
         import lietorch
+        from mast3r_slam.frame import Mode, create_frame
+        from mast3r_slam.mast3r_utils import mast3r_inference_mono
+
         tracking_stable = True
 
         try:
@@ -543,8 +538,11 @@ class SplatSLAM:
 
             # create_frame expects float32 [0,1] RGB numpy array
             frame = create_frame(
-                self._frame_idx, img_float, T_WC,
-                img_size=self._img_size, device=str(self._device),
+                self._frame_idx,
+                img_float,
+                T_WC,
+                img_size=self._img_size,
+                device=str(self._device),
             )
 
             if not self._initialized:
@@ -598,11 +596,18 @@ class SplatSLAM:
                     tx, ty, tz = pose[0, 3], pose[1, 3], pose[2, 3]
                     # Extract rotation angle from rotation matrix
                     import math
+
                     trace = pose[0, 0] + pose[1, 1] + pose[2, 2]
                     angle = math.degrees(math.acos(max(-1, min(1, (trace - 1) / 2))))
                     log.info(
                         "Track %d: pos=[%.3f,%.3f,%.3f] rot=%.1f° kf=%s reloc=%s",
-                        self._frame_idx, tx, ty, tz, angle, add_new_kf, try_reloc,
+                        self._frame_idx,
+                        tx,
+                        ty,
+                        tz,
+                        angle,
+                        add_new_kf,
+                        try_reloc,
                     )
 
                 self._new_kf_this_frame = False
@@ -628,7 +633,7 @@ class SplatSLAM:
             pose_matrix = frame.T_WC.matrix().detach().cpu().numpy().astype(np.float64)
             if pose_matrix.ndim == 3:
                 pose_matrix = pose_matrix[0]  # Remove batch dim
-            pose_valid = not getattr(self, '_reloc_count', 0) > 0
+            pose_valid = not getattr(self, "_reloc_count", 0) > 0
             if pose_valid:
                 self._last_pose = pose_matrix
                 self._last_good_pose = pose_matrix
@@ -710,8 +715,8 @@ class SplatSLAM:
             tracking_quality=quality,
             num_points=num_points,
             num_keyframes=num_kf,
-            tracking_lost=getattr(self, '_reloc_count', 0) > 0,
-            new_keyframe=getattr(self, '_new_kf_this_frame', False),
+            tracking_lost=getattr(self, "_reloc_count", 0) > 0,
+            new_keyframe=getattr(self, "_new_kf_this_frame", False),
             tracking_stable=tracking_stable,
             planning_points=planning_points,
         )
@@ -751,9 +756,9 @@ class SplatSLAM:
             try:
                 with kf.lock:
                     T_WC = lietorch.Sim3(kf.T_WC[i])  # [1, 8] → Sim3
-                    X = kf.X[i]         # [H*W, 3] points in camera frame
-                    C = kf.C[i]         # [H*W, 1] confidence
-                    uimg = kf.uimg[i]   # [H, W, 3] unnormalized image (CPU, 0-1)
+                    X = kf.X[i]  # [H*W, 3] points in camera frame
+                    C = kf.C[i]  # [H*W, 1] confidence
+                    uimg = kf.uimg[i]  # [H, W, 3] unnormalized image (CPU, 0-1)
 
                 conf = C.squeeze(-1)
                 mask = conf > 1.0
@@ -797,19 +802,26 @@ class SplatSLAM:
         fd, tmp_path = tempfile.mkstemp(suffix=".ply", dir=dir_path)
         os.close(fd)
 
-        vertices = np.empty(len(pts), dtype=[
-            ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
-            ('red', 'u1'), ('green', 'u1'), ('blue', 'u1'),
-        ])
+        vertices = np.empty(
+            len(pts),
+            dtype=[
+                ("x", "f4"),
+                ("y", "f4"),
+                ("z", "f4"),
+                ("red", "u1"),
+                ("green", "u1"),
+                ("blue", "u1"),
+            ],
+        )
         # Camera convention: Y down, Z forward → Three.js: Y up, Z backward
-        vertices['x'] = pts[:, 0]
-        vertices['y'] = -pts[:, 1]  # Flip Y (camera Y-down → Three.js Y-up)
-        vertices['z'] = -pts[:, 2]  # Flip Z (camera Z-forward → Three.js Z-backward)
-        vertices['red'] = colors[:, 0]
-        vertices['green'] = colors[:, 1]
-        vertices['blue'] = colors[:, 2]
+        vertices["x"] = pts[:, 0]
+        vertices["y"] = -pts[:, 1]  # Flip Y (camera Y-down → Three.js Y-up)
+        vertices["z"] = -pts[:, 2]  # Flip Z (camera Z-forward → Three.js Z-backward)
+        vertices["red"] = colors[:, 0]
+        vertices["green"] = colors[:, 1]
+        vertices["blue"] = colors[:, 2]
 
-        el = PlyElement.describe(vertices, 'vertex')
+        el = PlyElement.describe(vertices, "vertex")
         PlyData([el], text=False).write(tmp_path)
         os.chmod(tmp_path, 0o644)
         os.replace(tmp_path, path)
@@ -833,17 +845,17 @@ class SplatSLAM:
     def get_strip_distances(depth_map: np.ndarray) -> tuple[float, float, float]:
         """Nearest obstacle distance (m) in left, center, right strips."""
         h, w = depth_map.shape[:2]
-        roi = depth_map[int(h * 0.3):int(h * 0.8), :]
+        roi = depth_map[int(h * 0.3) : int(h * 0.8), :]
 
         strip_w = w // 3
         left = float(np.percentile(roi[:, :strip_w], 10))
-        center = float(np.percentile(roi[:, strip_w:2*strip_w], 10))
-        right = float(np.percentile(roi[:, 2*strip_w:], 10))
+        center = float(np.percentile(roi[:, strip_w : 2 * strip_w], 10))
+        right = float(np.percentile(roi[:, 2 * strip_w :], 10))
         return round(left, 2), round(center, 2), round(right, 2)
 
     @staticmethod
     def get_center_distance(depth_map: np.ndarray) -> float:
         """Nearest obstacle distance (m) in the central region."""
         h, w = depth_map.shape[:2]
-        roi = depth_map[int(h * 0.3):int(h * 0.8), int(w * 0.3):int(w * 0.7)]
+        roi = depth_map[int(h * 0.3) : int(h * 0.8), int(w * 0.3) : int(w * 0.7)]
         return round(float(np.percentile(roi, 10)), 2)

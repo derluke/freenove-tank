@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from tankbot.shared.protocol import clamp_servo, SERVO_DEFAULTS
+
+from tankbot.shared.protocol import SERVO_DEFAULTS, clamp_servo
 
 log = logging.getLogger(__name__)
 
@@ -21,8 +22,8 @@ _PINS = {0: 7, 1: 8, 2: 25}
 
 # Sweep config
 _SWEEP_INTERVAL = 0.02  # 50 Hz — one step every 20ms
-_SWEEP_STEP = 3         # degrees per tick (~150°/sec)
-_DETACH_DELAY = 0.5     # seconds after reaching target before cutting PWM
+_SWEEP_STEP = 3  # degrees per tick (~150°/sec)
+_DETACH_DELAY = 0.5  # seconds after reaching target before cutting PWM
 
 
 class _GpiozeroBackend:
@@ -75,8 +76,12 @@ class _HardwarePWMBackend:
         from gpiozero import AngularServo
 
         self._servo2 = AngularServo(
-            25, initial_angle=0, min_angle=0, max_angle=180,
-            min_pulse_width=0.5 / 1000, max_pulse_width=2.5 / 1000,
+            25,
+            initial_angle=0,
+            min_angle=0,
+            max_angle=180,
+            min_pulse_width=0.5 / 1000,
+            max_pulse_width=2.5 / 1000,
         )
 
     def set_angle(self, channel: int, angle: int) -> None:

@@ -200,6 +200,28 @@ Recovery: BROKEN → DEGRADED → HEALTHY requires re-meeting the entry criteria
 
 **Exit criterion:** one monocular depth model selected, benchmarked, wrapped, and demonstrated to meet the gate on the target hardware. Phase 1 cannot start otherwise — or must scope itself to ultrasonic-only, which is probably not worth shipping.
 
+#### Phase 0b measured results (2026-04-11)
+
+Hardware: RTX 4070 Ti SUPER (16 GiB), torch 2.10+cu128, 640×480 serial inference, 15 warmup / 150 measured iterations, CUDA-synced per frame, `recordings/mast3r_raw/vanilla1`. Full JSON reports in `logs/depth_bench/phase0b_base/`.
+
+| Backend | Checkpoint | Mean ms | p99 ms | Sustained FPS | Peak GPU MiB | Verdict |
+|---|---|---|---|---|---|---|
+| Depth Anything V2 | `…Metric-Indoor-Small-hf` | 17.9 | 19.3 | 55.9 | 245 | **PASS** |
+| Depth Anything V2 | `…Metric-Indoor-Base-hf`  | 43.3 | 45.7 | 23.1 | 615 | **PASS** |
+| Depth Anything V2 | `…Metric-Indoor-Large-hf` | 125.9 | 130.2 | 7.9 | 1711 | FAIL (latency + FPS) |
+| Depth Pro | `apple/DepthPro-hf` | 340.1 | 345.1 | 2.9 | 3776 | FAIL (large margin) |
+| UniDepth | `lpiccinelli/unidepth-v2-vitl14` | — | — | — | — | deferred (upstream pkg not installed) |
+
+**Selection:** Depth Anything V2 **Base** (`depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf`). Base is the default for Phase 1. It clears the 15 Hz target with ~8 ms headroom per frame at 23 Hz sustained and keeps peak GPU under 620 MiB, leaving ample room for MASt3R offline reconstruction to co-exist. Median reported depth on an indoor hallway frame was 1.85 m (min 0.81, max 6.48), consistent with the scene geometry — a decent metric-sanity check pending Phase 0c tape-measured ground truth.
+
+**Loop architecture decision:** Base inference is ~43 ms on this GPU, which is above the 20 Hz threshold the plan set for keeping `_decision_loop` serialized (≥ 20 Hz → serialized is fine). We land Phase 1 with the serialized loop and revisit a fast-reactive/slow-producer split only if camera + preprocessing headroom shrinks below the 10 Hz floor in practice. Small variant (56 Hz) is the fallback if Base proves too slow in the live pipeline end-to-end.
+
+**Depth Pro verdict:** single-shot inference is ~12× too slow for the reactive tick on this hardware, and peak GPU memory is ~6× higher than Base. Quality is not disputed, but performance rules it out for live control. It remains a viable offline labeler for Phase 0c ground-truth augmentation if needed.
+
+**UniDepth verdict:** deferred. Upstream package is not on PyPI and its CUDA-op install path is fragile. Not a blocker: Depth Anything V2 Base already passes the gate, and there is no quality-driven reason to chase UniDepth unless Base fails on a downstream quality metric in Phase 0c.
+
+**Benchmark harness:** `tankbot-benchmark-depth --dataset <path> --backends depth_anything_v2 depth_pro unidepth`. Per-backend checkpoint is overridable via `TANKBOT_DEPTH_ANYTHING_V2_CHECKPOINT` / `TANKBOT_DEPTH_PRO_CHECKPOINT` / `TANKBOT_UNIDEPTH_CHECKPOINT` env vars so re-benchmarking different variants does not require code changes. Reports land in `logs/depth_bench/<timestamp>/` as one JSON per backend plus a `summary.json`.
+
 ### Phase 0c — Curate replay set + metrics
 
 **Prerequisite:** Phase 0a landed (the harness can read multi-channel data) and at least a few representative multi-channel recordings exist.

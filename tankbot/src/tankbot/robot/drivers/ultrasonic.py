@@ -14,9 +14,9 @@ log = logging.getLogger(__name__)
 
 class _GpiozeroBackend:
     def __init__(self, trigger: int, echo: int) -> None:
-        from gpiozero import DistanceSensor
         import warnings
-        from gpiozero import PWMSoftwareFallback
+
+        from gpiozero import DistanceSensor, PWMSoftwareFallback
 
         warnings.filterwarnings("ignore", category=PWMSoftwareFallback)
         self._sensor = DistanceSensor(echo=echo, trigger=trigger, max_distance=3)
