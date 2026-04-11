@@ -24,3 +24,5 @@ tankbot/vendor/
 tankbot/calibration/captures/*
 *.log
 *.csv
+tankbot/logs/
+tankbot/recordings/
