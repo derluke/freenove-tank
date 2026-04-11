@@ -36,6 +36,11 @@ tasks:
         "{{.LOCAL_DIR}}/pyproject.toml"
         "{{.LOCAL_DIR}}/uv.lock"
         {{.PI_USER}}@{{.PI_HOST}}:{{.PI_DIR}}/
+      - ssh {{.PI_USER}}@{{.PI_HOST}} "mkdir -p {{.PI_DIR}}/vendor"
+      - >-
+        rsync -avz --delete
+        "{{.LOCAL_DIR}}/vendor/lietorch"
+        {{.PI_USER}}@{{.PI_HOST}}:{{.PI_DIR}}/vendor/
 
   pi:install:
     desc: Install Python dependencies on the Pi
@@ -122,16 +127,60 @@ tasks:
     cmds:
       - uv sync --extra desktop
 
-  vision:start:
-    desc: Start the 3DGS SLAM vision engine
+  vision:setup:viz:
+    desc: Install the vendored MASt3R-SLAM viewer stack (imgui/in3d/moderngl)
     cmds:
-      - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000
+      - uv pip install --python .venv/bin/python -e vendor/MASt3R-SLAM/thirdparty/in3d
+
+  vision:setup:rope:
+    desc: Build the CUDA RoPE2D extension used by upstream MASt3R/DUSt3R
+    env:
+      TORCH_CUDA_ARCH_LIST: "8.9"
+    cmds:
+      - >-
+        uv pip install --python .venv/bin/python --no-build-isolation
+        -e vendor/MASt3R-SLAM/thirdparty/mast3r/dust3r/croco/models/curope
+
+  vision:start:
+    desc: Start vanilla live MASt3R-SLAM on the robot camera and export to the web viewer
+    cmds:
+      - >-
+        UV_CACHE_DIR=/tmp/uv-cache
+        ROBOT_URL=ws://{{.PI_HOST}}:9000
+        TANKBOT_LIVE_PLY_PATH=tankbot_web/priv/static/assets/splat/scene.ply
+        TANKBOT_LIVE_PLY_EVERY={{default "10" .EXPORT_EVERY}}
+        uv run python vendor/MASt3R-SLAM/main.py
+        --dataset robot
+        --config vendor/MASt3R-SLAM/config/base.yaml
+        --no-viz
 
   vision:start:calib:
-    desc: Start the vision engine with camera calibration enabled
+    desc: Start vanilla live MASt3R-SLAM with camera calibration and export to the web viewer
     preconditions:
       - sh: test -n "{{.CAMERA_CALIB}}"
         msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:start:calib CAMERA_CALIB=vendor/MASt3R-SLAM/config/intrinsics.yaml`
+    cmds:
+      - >-
+        UV_CACHE_DIR=/tmp/uv-cache
+        ROBOT_URL=ws://{{.PI_HOST}}:9000
+        TANKBOT_LIVE_PLY_PATH=tankbot_web/priv/static/assets/splat/scene.ply
+        TANKBOT_LIVE_PLY_EVERY={{default "10" .EXPORT_EVERY}}
+        uv run python vendor/MASt3R-SLAM/main.py
+        --dataset robot
+        --config vendor/MASt3R-SLAM/config/base.yaml
+        --calib {{.CAMERA_CALIB}}
+        --no-viz
+
+  vision:legacy:start:
+    desc: Start the old integrated Tankbot vision engine
+    cmds:
+      - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000
+
+  vision:legacy:start:calib:
+    desc: Start the old integrated Tankbot vision engine with camera calibration enabled
+    preconditions:
+      - sh: test -n "{{.CAMERA_CALIB}}"
+        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:legacy:start:calib CAMERA_CALIB=vendor/MASt3R-SLAM/config/intrinsics.yaml`
     cmds:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --calib {{.CAMERA_CALIB}}
 
@@ -169,6 +218,106 @@ tasks:
         --robot ws://{{.PI_HOST}}:9000
         --output calibration/camera_intrinsics.yaml
 
+  vision:record:raw:
+    desc: Record raw robot webcam frames to a folder for vanilla MASt3R-SLAM
+    cmds:
+      - >-
+        uv run tankbot-record-robot-stream
+        --robot ws://{{.PI_HOST}}:9000
+        --output-dir recordings/mast3r_raw/{{default "latest" .RUN}}
+        --max-frames {{default "600" .MAX_FRAMES}}
+        --duration {{default "0" .DURATION}}
+
+  vision:vanilla:mast3r:
+    desc: Run upstream MASt3R-SLAM on a recorded raw frame folder
+    preconditions:
+      - sh: test -n "{{.DATASET}}"
+        msg: Set DATASET to a raw frame folder, e.g. `task vision:vanilla:mast3r DATASET=recordings/mast3r_raw/latest CAMERA_CALIB=calibration/camera_intrinsics.yaml`
+      - sh: test -n "{{.CAMERA_CALIB}}"
+        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:vanilla:mast3r DATASET=recordings/mast3r_raw/latest CAMERA_CALIB=calibration/camera_intrinsics.yaml`
+    cmds:
+      - >-
+        UV_CACHE_DIR=/tmp/uv-cache
+        uv run python vendor/MASt3R-SLAM/main.py
+        --dataset {{.DATASET}}
+        --config vendor/MASt3R-SLAM/config/base.yaml
+        --calib {{.CAMERA_CALIB}}
+        --no-viz
+
+  vision:vanilla:robot:
+    desc: Run upstream MASt3R-SLAM live on the Tankbot camera stream
+    preconditions:
+      - sh: test -n "{{.CAMERA_CALIB}}"
+        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:vanilla:robot CAMERA_CALIB=calibration/camera_intrinsics.yaml`
+    cmds:
+      - >-
+        UV_CACHE_DIR=/tmp/uv-cache
+        ROBOT_URL=ws://{{.PI_HOST}}:9000
+        uv run python vendor/MASt3R-SLAM/main.py
+        --dataset robot
+        --config vendor/MASt3R-SLAM/config/base.yaml
+        --calib {{.CAMERA_CALIB}}
+
+  vision:vanilla:robot:headless:
+    desc: Run upstream MASt3R-SLAM live on the Tankbot camera stream without the viewer
+    preconditions:
+      - sh: test -n "{{.CAMERA_CALIB}}"
+        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:vanilla:robot:headless CAMERA_CALIB=calibration/camera_intrinsics.yaml`
+    cmds:
+      - >-
+        UV_CACHE_DIR=/tmp/uv-cache
+        ROBOT_URL=ws://{{.PI_HOST}}:9000
+        uv run python vendor/MASt3R-SLAM/main.py
+        --dataset robot
+        --config vendor/MASt3R-SLAM/config/base.yaml
+        --calib {{.CAMERA_CALIB}}
+        --no-viz
+
+  vision:vanilla:robot:web:
+    desc: Run upstream MASt3R-SLAM live and periodically export the latest PLY to the web viewer
+    preconditions:
+      - sh: test -n "{{.CAMERA_CALIB}}"
+        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:vanilla:robot:web CAMERA_CALIB=calibration/camera_intrinsics.yaml`
+    cmds:
+      - >-
+        mkdir -p tankbot_web/priv/static/assets/splat
+      - >-
+        UV_CACHE_DIR=/tmp/uv-cache
+        ROBOT_URL=ws://{{.PI_HOST}}:9000
+        TANKBOT_LIVE_PLY_PATH=tankbot_web/priv/static/assets/splat/scene.ply
+        TANKBOT_LIVE_PLY_EVERY={{default "30" .EXPORT_EVERY}}
+        uv run python vendor/MASt3R-SLAM/main.py
+        --dataset robot
+        --config vendor/MASt3R-SLAM/config/base.yaml
+        --calib {{.CAMERA_CALIB}}
+        --no-viz
+
+  vision:replay:robot:
+    desc: Run Tankbot's own SLAM adapter on a recorded raw frame folder
+    preconditions:
+      - sh: test -n "{{.DATASET}}"
+        msg: Set DATASET to a raw frame folder, e.g. `task vision:replay:robot DATASET=recordings/mast3r_raw/latest CAMERA_CALIB=calibration/camera_intrinsics.yaml`
+      - sh: test -n "{{.CAMERA_CALIB}}"
+        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:replay:robot DATASET=recordings/mast3r_raw/latest CAMERA_CALIB=calibration/camera_intrinsics.yaml`
+    cmds:
+      - >-
+        UV_CACHE_DIR=/tmp/uv-cache
+        uv run tankbot-replay-slam-dataset
+        --dataset {{.DATASET}}
+        --save-as {{default "robot_replay" .RUN}}
+        --calib {{.CAMERA_CALIB}}
+
+  vision:vanilla:publish:
+    desc: Publish a saved vanilla MASt3R-SLAM PLY into the web assets for viewing
+    preconditions:
+      - sh: test -n "{{.RUN}}"
+        msg: Set RUN to a saved run basename, e.g. `task vision:vanilla:publish RUN=vanilla1`
+      - sh: test -f "logs/{{.RUN}}.ply"
+        msg: Missing logs/{{.RUN}}.ply. Run `vision:vanilla:mast3r` first.
+    cmds:
+      - mkdir -p tankbot_web/priv/static/assets/splat/saved
+      - cp "logs/{{.RUN}}.ply" "tankbot_web/priv/static/assets/splat/saved/{{.RUN}}.ply"
+
   slam:setup:
     desc: Clone MASt3R-SLAM and build CUDA extensions
     env:
@@ -180,6 +329,10 @@ tasks:
         git clone --recursive https://github.com/rmurai0610/MASt3R-SLAM.git vendor/MASt3R-SLAM
       - bash scripts/patch-mast3r-slam.sh vendor/MASt3R-SLAM
       - uv pip install --python .venv/bin/python setuptools
+      - >-
+        uv pip install --python .venv/bin/python --no-build-isolation
+        -e vendor/MASt3R-SLAM/thirdparty/mast3r/dust3r/croco/models/curope
+      - uv pip install --python .venv/bin/python -e vendor/MASt3R-SLAM/thirdparty/in3d
       - uv pip install --no-build-isolation --python .venv/bin/python -e vendor/MASt3R-SLAM/thirdparty/mast3r
       - uv pip install --no-build-isolation --python .venv/bin/python -e vendor/MASt3R-SLAM
       # Download model checkpoints (~2.6 GB total)

@@ -32,7 +32,46 @@ defmodule TankbotWebWeb.DashboardLive do
        slam_ply_version: 0,
        autonomy_goal: nil,
        autonomy_behavior: nil,
-       autonomy_phase: nil
+       autonomy_phase: nil,
+       planner_mode: nil,
+       frontier_count: 0,
+       coverage_ratio: 0.0,
+       planner_reason: nil,
+       selected_frontier: nil,
+       status_detail: nil,
+       lost_count: 0,
+       scan_steps_remaining: 0,
+       scan_round: 0,
+       planner_target_heading_deg: nil,
+       planner_target_cell: nil,
+       force_live_ply: false,
+       manual_ply_url: nil,
+       manual_ply_label: nil
+     )}
+  end
+
+  @impl true
+  def handle_params(params, _uri, socket) do
+    force_live_ply = params["live"] in ["1", "true", "yes"]
+
+    ply_name =
+      case params["ply"] do
+        nil -> nil
+        "" -> nil
+        name -> name
+      end
+
+    socket =
+      case ply_name do
+        nil -> socket
+        name -> push_event(socket, "splat_saved_ply", %{ply_url: "/assets/splat/saved/#{name}"})
+      end
+
+    {:noreply,
+     assign(socket,
+       force_live_ply: force_live_ply,
+       manual_ply_url: if(ply_name, do: "/assets/splat/saved/#{ply_name}", else: nil),
+       manual_ply_label: ply_name
      )}
   end
 
@@ -57,7 +96,18 @@ defmodule TankbotWebWeb.DashboardLive do
         slam_ply_version: slam["ply_version"] || socket.assigns.slam_ply_version,
         autonomy_goal: autonomy["goal"] || socket.assigns.autonomy_goal,
         autonomy_behavior: autonomy["behavior"] || socket.assigns.autonomy_behavior,
-        autonomy_phase: autonomy["phase"] || socket.assigns.autonomy_phase
+        autonomy_phase: autonomy["phase"] || socket.assigns.autonomy_phase,
+        planner_mode: autonomy["planner_mode"] || socket.assigns.planner_mode,
+        frontier_count: autonomy["frontier_count"] || socket.assigns.frontier_count,
+        coverage_ratio: autonomy["coverage_ratio"] || socket.assigns.coverage_ratio,
+        planner_reason: autonomy["planner_reason"] || socket.assigns.planner_reason,
+        selected_frontier: autonomy["selected_frontier"] || socket.assigns.selected_frontier,
+        status_detail: autonomy["status_detail"] || socket.assigns.status_detail,
+        lost_count: autonomy["lost_count"] || socket.assigns.lost_count,
+        scan_steps_remaining: autonomy["scan_steps_remaining"] || socket.assigns.scan_steps_remaining,
+        scan_round: autonomy["scan_round"] || socket.assigns.scan_round,
+        planner_target_heading_deg: autonomy["planner_target_heading_deg"] || socket.assigns.planner_target_heading_deg,
+        planner_target_cell: autonomy["planner_target_cell"] || socket.assigns.planner_target_cell
       )
 
     # Push camera pose to JS hook every frame (for robot marker)
@@ -181,6 +231,15 @@ defmodule TankbotWebWeb.DashboardLive do
   defp distance_color(d) when d > 0 and d < 50, do: "text-yellow-400"
   defp distance_color(_), do: "text-green-400"
 
+  defp panel_status_label(assigns) do
+    cond do
+      assigns.vision_active -> vision_state_label(assigns.vision_state)
+      not is_nil(assigns.manual_ply_url) -> "Saved PLY"
+      assigns.force_live_ply -> "Live PLY"
+      true -> "Unknown"
+    end
+  end
+
   @impl true
   def render(assigns) do
     ~H"""
@@ -260,11 +319,13 @@ defmodule TankbotWebWeb.DashboardLive do
           </div>
 
           <%!-- Vision status panel --%>
-          <%= if @vision_active do %>
+          <%= if @vision_active or (not is_nil(@manual_ply_url)) or @force_live_ply do %>
             <div class="bg-gray-800 rounded-lg p-4 border border-blue-500/30">
               <h2 class="text-xl font-semibold mb-3 flex items-center gap-2">
                 Vision Autonomy
-                <span class={"text-xs px-2 py-0.5 rounded-full #{vision_state_color(@vision_state)}"}><%= vision_state_label(@vision_state) %></span>
+                <span class={"text-xs px-2 py-0.5 rounded-full #{vision_state_color(@vision_state)}"}>
+                  <%= panel_status_label(assigns) %>
+                </span>
               </h2>
               <div class="text-sm text-gray-300 space-y-3">
                 <%!-- Depth proximity meter (left / center / right) in meters --%>
@@ -310,6 +371,7 @@ defmodule TankbotWebWeb.DashboardLive do
                   phx-update="ignore"
                   data-ply-epoch={@slam_ply_epoch}
                   data-ply-version={@slam_ply_version}
+                  data-ply-url={@manual_ply_url}
                   class="w-full rounded border border-gray-700"
                   style="height: 400px;"
                 ></div>
@@ -317,11 +379,28 @@ defmodule TankbotWebWeb.DashboardLive do
                   <span>Points: <span class="font-mono"><%= @slam_num_points %></span></span>
                   <span>Tracking: <span class="font-mono"><%= if @slam_tracking_quality > 0, do: "#{round(@slam_tracking_quality * 100)}%", else: "\u2014" %></span></span>
                   <span>PLY: <span class="font-mono">v<%= @slam_ply_version %></span></span>
+                  <span :if={@manual_ply_label}>Saved: <span class="font-mono"><%= @manual_ply_label %></span></span>
                 </div>
                 <div class="flex gap-4 mt-2 text-xs text-gray-500">
                   <span>Goal: <span class="font-mono"><%= @autonomy_goal || "\u2014" %></span></span>
                   <span>Behavior: <span class="font-mono"><%= @autonomy_behavior || "\u2014" %></span></span>
                   <span>Phase: <span class="font-mono"><%= @autonomy_phase || "\u2014" %></span></span>
+                </div>
+                <div class="flex gap-4 mt-2 text-xs text-gray-500">
+                  <span>Planner: <span class="font-mono"><%= @planner_mode || "\u2014" %></span></span>
+                  <span>Frontiers: <span class="font-mono"><%= @frontier_count %></span></span>
+                  <span>Coverage: <span class="font-mono"><%= round(@coverage_ratio * 100) %>%</span></span>
+                  <span>Reason: <span class="font-mono"><%= @planner_reason || "\u2014" %></span></span>
+                </div>
+                <div class="mt-3 rounded bg-gray-900/70 border border-gray-700 px-3 py-2">
+                  <div class="text-[11px] uppercase tracking-wide text-gray-500 mb-1">Current Intent</div>
+                  <div class="text-sm text-blue-100"><%= @status_detail || "Waiting for autonomy state…" %></div>
+                  <div class="flex flex-wrap gap-4 mt-2 text-xs text-gray-400">
+                    <span>Lost Frames: <span class="font-mono text-gray-200"><%= @lost_count %></span></span>
+                    <span>Scan: <span class="font-mono text-gray-200">r<%= @scan_round %> / <%= @scan_steps_remaining %> left</span></span>
+                    <span>Heading: <span class="font-mono text-gray-200"><%= if @planner_target_heading_deg != nil, do: "#{@planner_target_heading_deg}°", else: "\u2014" %></span></span>
+                    <span>Target Cell: <span class="font-mono text-gray-200"><%= if @planner_target_cell, do: inspect(@planner_target_cell), else: "\u2014" %></span></span>
+                  </div>
                 </div>
               </div>
             </div>

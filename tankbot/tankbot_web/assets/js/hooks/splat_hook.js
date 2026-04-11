@@ -17,6 +17,10 @@ export const SplatViewer = {
     this.container = this.el
     this.currentEpoch = this.el.dataset.plyEpoch || null
     this.currentVersion = 0
+    const urlParams = new URLSearchParams(window.location.search)
+    const queryPly = urlParams.get("ply")
+    this.liveMode = ["1", "true", "yes"].includes((urlParams.get("live") || "").toLowerCase())
+    this.manualPlyUrl = queryPly ? `/assets/splat/saved/${queryPly}` : (this.el.dataset.plyUrl || null)
     this.renderer = null
     this.scene = null
     this.camera = null
@@ -25,6 +29,8 @@ export const SplatViewer = {
     this.robotMarker = null
     this.animFrameId = null
     this.loading = false
+    this.livePollTimer = null
+    this.hasInitialView = false
     this.plyLoader = new PLYLoader()
     // MASt3R-SLAM exports standard PLY with (x,y,z,red,green,blue)
     // PLYLoader reads these natively — no custom mapping needed
@@ -34,14 +40,29 @@ export const SplatViewer = {
     this._showWaiting()
     this._animate()
 
-    const initialVersion = Number(this.el.dataset.plyVersion || 0)
-    if (initialVersion > 0) {
-      this.currentVersion = initialVersion
-      this._loadPLY(this._plyUrl(this.currentEpoch, initialVersion))
+    if (this.manualPlyUrl) {
+      this._loadPLY(this.manualPlyUrl)
+    } else if (this.liveMode) {
+      this._startLivePolling()
+    } else {
+      const initialVersion = Number(this.el.dataset.plyVersion || 0)
+      if (initialVersion > 0) {
+        this.currentVersion = initialVersion
+        this._loadPLY(this._plyUrl(this.currentEpoch, initialVersion))
+      }
     }
 
     this.handleEvent("splat_update", (data) => {
       this._hideWaiting()
+
+      if (this.manualPlyUrl) {
+        if (data.pose_valid === false || !data.camera_pose) {
+          this.robotMarker.visible = false
+        } else if (data.camera_pose.length === 16) {
+          this._updateRobotMarker(data.camera_pose)
+        }
+        return
+      }
 
       if (data.ply_epoch && data.ply_epoch !== this.currentEpoch) {
         this.currentEpoch = data.ply_epoch
@@ -59,6 +80,14 @@ export const SplatViewer = {
         this._updateRobotMarker(data.camera_pose)
       }
     })
+
+    this.handleEvent("splat_saved_ply", (data) => {
+      if (!data?.ply_url) return
+      this.manualPlyUrl = data.ply_url
+      this.currentVersion = 0
+      this._hideWaiting()
+      this._loadPLY(this.manualPlyUrl)
+    })
   },
 
   _plyUrl(epoch, version) {
@@ -66,6 +95,17 @@ export const SplatViewer = {
     if (epoch) params.set("epoch", String(epoch))
     params.set("v", String(version))
     return `/assets/splat/scene.ply?${params.toString()}`
+  },
+
+  _livePlyUrl() {
+    return `/assets/splat/scene.ply?t=${Date.now()}`
+  },
+
+  _startLivePolling() {
+    this._loadPLY(this._livePlyUrl())
+    this.livePollTimer = window.setInterval(() => {
+      if (!this.loading) this._loadPLY(this._livePlyUrl())
+    }, 3000)
   },
 
   _initScene() {
@@ -165,6 +205,19 @@ export const SplatViewer = {
         const hasColor = !!geometry.attributes.color
         console.log("PLY attributes:", Object.keys(geometry.attributes), "hasColor:", hasColor)
 
+        // Upstream MASt3R-SLAM exports use a different world convention than the
+        // Tankbot live viewer. Match the existing viewer orientation in live mode.
+        if (this.liveMode && geometry.attributes.position) {
+          const pos = geometry.attributes.position
+          for (let i = 0; i < pos.count; i++) {
+            pos.setY(i, -pos.getY(i))
+            pos.setZ(i, -pos.getZ(i))
+          }
+          pos.needsUpdate = true
+          geometry.computeBoundingBox()
+          geometry.computeBoundingSphere()
+        }
+
         const material = new THREE.PointsMaterial({
           size: 0.008,
           vertexColors: hasColor,
@@ -173,6 +226,7 @@ export const SplatViewer = {
         })
 
         this.pointCloud = new THREE.Points(geometry, material)
+        this.pointCloud.frustumCulled = false
         this.scene.add(this.pointCloud)
 
         // Auto-center camera on the point cloud
@@ -185,8 +239,9 @@ export const SplatViewer = {
 
           console.log(`PLY loaded: ${geometry.attributes.position.count} points, center:`, center, "size:", size)
 
-          // Only auto-center on first load
-          if (this.currentVersion <= 2) {
+          // Only auto-center once. Live upstream mode reloads the same scene.ply
+          // repeatedly, so recentering every poll makes the camera jump.
+          if (!this.hasInitialView) {
             this.controls.target.copy(center)
             this.camera.position.set(
               center.x + maxDim * 0.7,
@@ -194,9 +249,11 @@ export const SplatViewer = {
               center.z + maxDim * 0.7,
             )
             this.camera.lookAt(center)
+            this.hasInitialView = true
           }
         }
 
+        this._hideWaiting()
         this.loading = false
       },
       undefined,
@@ -264,6 +321,7 @@ export const SplatViewer = {
   },
 
   destroyed() {
+    if (this.livePollTimer) window.clearInterval(this.livePollTimer)
     if (this.animFrameId) cancelAnimationFrame(this.animFrameId)
     if (this._resizeObserver) this._resizeObserver.disconnect()
     if (this.pointCloud) {

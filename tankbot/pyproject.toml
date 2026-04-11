@@ -2,8 +2,9 @@
 name = "tankbot"
 version = "0.1.0"
 description = "Autonomous tank robot — Pi brain + desktop GPU offload"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
+    "pyyaml>=6.0.3",
     "websockets>=13.0",
 ]
 
@@ -11,6 +12,7 @@ dependencies = [
 # Install on the Raspberry Pi
 robot = [
     "gpiozero",
+    "numpy>=1.26",
     "picamera2",
     "rpi-hardware-pwm",
     "lgpio",
@@ -18,22 +20,35 @@ robot = [
 ]
 # Install on the desktop
 desktop = [
-    "websockets>=13.0",
+    "einops>=0.8.2",
+    "lietorch",
+    "natsort>=8.4.0",
+    "pyrealsense2>=2.56.5.9235",
     "opencv-python>=4.10",
     "torch>=2.4",
     "numpy>=1.26",
     "Pillow",
     "plyfile>=1.0",          # PLY export for Gaussian Splat maps
+    "torchvision>=0.25.0",
+    "tqdm>=4.67.3",
 ]
 
 [project.scripts]
 tankbot-robot = "tankbot.robot.main:main"
 tankbot-vision = "tankbot.desktop.autonomy.vision:main"
 tankbot-calibrate-camera = "tankbot.desktop.autonomy.calibrate_camera:main"
+tankbot-record-robot-stream = "tankbot.desktop.autonomy.record_robot_stream:main"
+tankbot-replay-slam-dataset = "tankbot.desktop.autonomy.replay_slam_dataset:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.uv.sources]
+lietorch = { path = "vendor/lietorch" }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tankbot"]
