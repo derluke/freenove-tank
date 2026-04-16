@@ -1,0 +1,29 @@
+# Camera extrinsics — one-time measurement.
+#
+# The Freenove tank camera is mechanically fixed on the chassis (the tilt
+# servo is locked). Measure these values once with a ruler + protractor
+# and do not touch them again unless you remount the camera.
+#
+# Robot frame: +x forward, +y left, +z up, origin at chassis center at
+# floor level.
+#
+# These defaults are EYEBALL estimates — replace with real measurements
+# before trusting the reactive safety layer in the live loop.
+
+# Camera optical center above the floor (meters).
+height_m: 0.12
+
+# Camera pitch: positive = tilted downward. Degrees.
+pitch_deg: 8.0
+
+# Camera yaw relative to robot forward. Positive = rotated left. Degrees.
+yaw_deg: 0.0
+
+# Camera roll about its optical axis. Degrees.
+roll_deg: 0.0
+
+# How far in front of the chassis center the optical center sits (m).
+x_offset_m: 0.08
+
+# How far to the left (+) or right (-) of chassis center (m).
+y_offset_m: 0.0

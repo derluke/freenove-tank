@@ -46,7 +46,37 @@ defmodule TankbotWebWeb.DashboardLive do
        planner_target_cell: nil,
        force_live_ply: false,
        manual_ply_url: nil,
-       manual_ply_label: nil
+       manual_ply_label: nil,
+       # Reactive engine state
+       reactive_engine: false,
+       reactive_stop_zone_blocked: false,
+       reactive_stop_zone_count: 0,
+       reactive_clearance_fwd: 0.0,
+       reactive_clearance_left: 0.0,
+       reactive_clearance_right: 0.0,
+       reactive_obstacle_points: 0,
+       reactive_motor_left: 0,
+       reactive_motor_right: 0,
+       reactive_depth_ms: 0.0,
+       reactive_total_ms: 0.0,
+       reactive_ultrasonic_m: nil,
+       reactive_frame_count: 0,
+       reactive_depth_image: nil,
+       reactive_map_image: nil,
+       reactive_pose_x: nil,
+       reactive_pose_y: nil,
+       reactive_pose_yaw: nil,
+       reactive_pose_health: nil,
+       reactive_map_cells: 0,
+       # IMU (MPU-6050) latest reading
+       imu_available: false,
+       imu_ax: 0.0,
+       imu_ay: 0.0,
+       imu_az: 0.0,
+       imu_gx: 0.0,
+       imu_gy: 0.0,
+       imu_gz: 0.0,
+       imu_temp_c: nil
      )}
   end
 
@@ -107,7 +137,28 @@ defmodule TankbotWebWeb.DashboardLive do
         scan_steps_remaining: autonomy["scan_steps_remaining"] || socket.assigns.scan_steps_remaining,
         scan_round: autonomy["scan_round"] || socket.assigns.scan_round,
         planner_target_heading_deg: autonomy["planner_target_heading_deg"] || socket.assigns.planner_target_heading_deg,
-        planner_target_cell: autonomy["planner_target_cell"] || socket.assigns.planner_target_cell
+        planner_target_cell: autonomy["planner_target_cell"] || socket.assigns.planner_target_cell,
+        # Reactive engine fields (present when engine == "reactive")
+        reactive_engine: autonomy["engine"] == "reactive",
+        reactive_stop_zone_blocked: autonomy["stop_zone_blocked"] || false,
+        reactive_stop_zone_count: autonomy["stop_zone_count"] || 0,
+        reactive_clearance_fwd: autonomy["clearance_forward_m"] || 0.0,
+        reactive_clearance_left: autonomy["clearance_left_m"] || 0.0,
+        reactive_clearance_right: autonomy["clearance_right_m"] || 0.0,
+        reactive_obstacle_points: autonomy["obstacle_points"] || 0,
+        reactive_motor_left: autonomy["motor_left"] || 0,
+        reactive_motor_right: autonomy["motor_right"] || 0,
+        reactive_depth_ms: autonomy["depth_ms"] || 0.0,
+        reactive_total_ms: autonomy["total_ms"] || 0.0,
+        reactive_ultrasonic_m: autonomy["ultrasonic_m"],
+        reactive_frame_count: autonomy["frame_count"] || 0,
+        reactive_depth_image: autonomy["depth_image"] || socket.assigns.reactive_depth_image,
+        reactive_map_image: autonomy["map_image"] || socket.assigns.reactive_map_image,
+        reactive_pose_x: get_in(autonomy, ["pose", "x"]),
+        reactive_pose_y: get_in(autonomy, ["pose", "y"]),
+        reactive_pose_yaw: get_in(autonomy, ["pose", "yaw_deg"]),
+        reactive_pose_health: get_in(autonomy, ["pose", "health"]),
+        reactive_map_cells: autonomy["map_cells"] || 0
       )
 
     # Push camera pose to JS hook every frame (for robot marker)
@@ -146,15 +197,35 @@ defmodule TankbotWebWeb.DashboardLive do
         ts -> System.monotonic_time(:second) - ts < 5
       end
 
-    {:noreply,
-     assign(socket,
-       distance: data["distance"] || 0.0,
-       mode: data["mode"] || 1,
-       motor_left: get_in(data, ["motor", "left"]) || 0,
-       motor_right: get_in(data, ["motor", "right"]) || 0,
-       ir: data["ir"] || 0,
-       vision_active: vision_active
-     )}
+    imu = data["imu"]
+
+    socket =
+      assign(socket,
+        distance: data["distance"] || 0.0,
+        mode: data["mode"] || 1,
+        motor_left: get_in(data, ["motor", "left"]) || 0,
+        motor_right: get_in(data, ["motor", "right"]) || 0,
+        ir: data["ir"] || 0,
+        vision_active: vision_active
+      )
+
+    socket =
+      if imu do
+        assign(socket,
+          imu_available: true,
+          imu_ax: imu["ax"] || 0.0,
+          imu_ay: imu["ay"] || 0.0,
+          imu_az: imu["az"] || 0.0,
+          imu_gx: imu["gx"] || 0.0,
+          imu_gy: imu["gy"] || 0.0,
+          imu_gz: imu["gz"] || 0.0,
+          imu_temp_c: imu["temp_c"]
+        )
+      else
+        socket
+      end
+
+    {:noreply, socket}
   end
 
   def handle_info({:frame, jpeg_bytes}, socket) do
@@ -210,6 +281,9 @@ defmodule TankbotWebWeb.DashboardLive do
   defp vision_state_label("avoiding"), do: "Avoiding"
   defp vision_state_label("backing_up"), do: "Backing up"
   defp vision_state_label("stopped"), do: "Stopped"
+  defp vision_state_label("forward"), do: "Forward"
+  defp vision_state_label("turning"), do: "Turning"
+  defp vision_state_label("reversing"), do: "Reversing"
   defp vision_state_label(_), do: "Unknown"
 
   defp vision_state_color("scanning"), do: "bg-blue-500"
@@ -217,6 +291,9 @@ defmodule TankbotWebWeb.DashboardLive do
   defp vision_state_color("avoiding"), do: "bg-yellow-500"
   defp vision_state_color("backing_up"), do: "bg-red-500"
   defp vision_state_color("stopped"), do: "bg-red-700"
+  defp vision_state_color("forward"), do: "bg-green-500"
+  defp vision_state_color("turning"), do: "bg-yellow-500"
+  defp vision_state_color("reversing"), do: "bg-red-500"
   defp vision_state_color(_), do: "bg-gray-500"
 
   # d is distance in meters — lower = closer = more dangerous
@@ -252,37 +329,64 @@ defmodule TankbotWebWeb.DashboardLive do
               <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-white opacity-75"></span>
               <span class="relative inline-flex rounded-full h-2 w-2 bg-white"></span>
             </span>
-            VISION: <%= vision_state_label(@vision_state) %>
+            <%= if @reactive_engine, do: "REACTIVE", else: "VISION" %>: <%= vision_state_label(@vision_state) %>
           </span>
         <% end %>
       </div>
 
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <%!-- Video feed --%>
+        <%!-- Video feed + depth map --%>
         <div class="bg-gray-800 rounded-lg p-4">
-          <h2 class="text-xl font-semibold mb-3">Camera</h2>
-          <div class="relative">
-            <%= if @frame_data do %>
-              <img src={"data:image/jpeg;base64,#{@frame_data}"} class="w-full rounded" />
-            <% else %>
-              <div class="w-full h-64 bg-gray-700 rounded flex items-center justify-center text-gray-400">
-                Waiting for video...
+          <%= if @reactive_engine and @reactive_depth_image do %>
+            <%!-- Camera + Depth side by side (large) --%>
+            <div class="grid grid-cols-2 gap-2">
+              <div>
+                <h2 class="text-sm font-semibold mb-1 text-gray-400">Camera</h2>
+                <%= if @frame_data do %>
+                  <img src={"data:image/jpeg;base64,#{@frame_data}"} class="w-full rounded" />
+                <% else %>
+                  <div class="w-full h-40 bg-gray-700 rounded flex items-center justify-center text-gray-400 text-sm">
+                    Waiting for video...
+                  </div>
+                <% end %>
+              </div>
+              <div>
+                <h2 class="text-sm font-semibold mb-1 text-gray-400">Depth</h2>
+                <img src={"data:image/jpeg;base64,#{@reactive_depth_image}"} class="w-full rounded" />
+              </div>
+            </div>
+            <%!-- Map below, full width --%>
+            <%= if @reactive_map_image do %>
+              <div class="mt-2">
+                <h2 class="text-sm font-semibold mb-1 text-gray-400">Map</h2>
+                <img src={"data:image/jpeg;base64,#{@reactive_map_image}"} class="w-full rounded max-h-64 mx-auto object-contain" />
               </div>
             <% end %>
-            <%!-- YOLO bounding boxes --%>
-            <%= if @vision_active and @frame_data do %>
-              <%= for det <- @vision_detections do %>
-                <div
-                  class="absolute border-2 border-yellow-400 rounded-sm pointer-events-none"
-                  style={"left:#{det["x1"]}%;top:#{det["y1"]}%;width:#{det["x2"] - det["x1"]}%;height:#{det["y2"] - det["y1"]}%"}
-                >
-                  <span class="absolute -top-5 left-0 bg-yellow-400 text-black text-[10px] font-bold px-1 rounded-sm whitespace-nowrap">
-                    <%= det["class"] %> <%= round(det["confidence"] * 100) %>% · <%= :erlang.float_to_binary((det["depth"] || 0) / 1, [decimals: 2]) %>m
-                  </span>
+          <% else %>
+            <h2 class="text-xl font-semibold mb-3">Camera</h2>
+            <div class="relative">
+              <%= if @frame_data do %>
+                <img src={"data:image/jpeg;base64,#{@frame_data}"} class="w-full rounded" />
+              <% else %>
+                <div class="w-full h-64 bg-gray-700 rounded flex items-center justify-center text-gray-400">
+                  Waiting for video...
                 </div>
               <% end %>
-            <% end %>
-          </div>
+              <%!-- YOLO bounding boxes --%>
+              <%= if @vision_active and @frame_data do %>
+                <%= for det <- @vision_detections do %>
+                  <div
+                    class="absolute border-2 border-yellow-400 rounded-sm pointer-events-none"
+                    style={"left:#{det["x1"]}%;top:#{det["y1"]}%;width:#{det["x2"] - det["x1"]}%;height:#{det["y2"] - det["y1"]}%"}
+                  >
+                    <span class="absolute -top-5 left-0 bg-yellow-400 text-black text-[10px] font-bold px-1 rounded-sm whitespace-nowrap">
+                      <%= det["class"] %> <%= round(det["confidence"] * 100) %>% · <%= :erlang.float_to_binary((det["depth"] || 0) / 1, [decimals: 2]) %>m
+                    </span>
+                  </div>
+                <% end %>
+              <% end %>
+            </div>
+          <% end %>
         </div>
 
         <%!-- Telemetry + Controls --%>
@@ -318,8 +422,124 @@ defmodule TankbotWebWeb.DashboardLive do
             </div>
           </div>
 
-          <%!-- Vision status panel --%>
-          <%= if @vision_active or (not is_nil(@manual_ply_url)) or @force_live_ply do %>
+          <%!-- IMU panel --%>
+          <%= if @imu_available do %>
+            <div class="bg-gray-800 rounded-lg p-4 border border-indigo-500/30">
+              <h2 class="text-xl font-semibold mb-3 flex items-center gap-2">
+                IMU
+                <span class="text-xs px-2 py-0.5 rounded-full bg-indigo-700">MPU-6050</span>
+                <%= if @imu_temp_c do %>
+                  <span class="text-xs text-gray-400 ml-auto font-mono"><%= :erlang.float_to_binary(@imu_temp_c / 1, [decimals: 1]) %>&deg;C</span>
+                <% end %>
+              </h2>
+              <div class="grid grid-cols-2 gap-4 text-sm">
+                <div>
+                  <div class="text-gray-400 text-xs mb-1">Accel (g)</div>
+                  <div class="grid grid-cols-3 gap-2 font-mono text-xs">
+                    <div><span class="text-gray-500">X</span> <span class="text-blue-200"><%= :erlang.float_to_binary(@imu_ax / 1, [decimals: 2]) %></span></div>
+                    <div><span class="text-gray-500">Y</span> <span class="text-blue-200"><%= :erlang.float_to_binary(@imu_ay / 1, [decimals: 2]) %></span></div>
+                    <div><span class="text-gray-500">Z</span> <span class="text-blue-200"><%= :erlang.float_to_binary(@imu_az / 1, [decimals: 2]) %></span></div>
+                  </div>
+                </div>
+                <div>
+                  <div class="text-gray-400 text-xs mb-1">Gyro (&deg;/s)</div>
+                  <div class="grid grid-cols-3 gap-2 font-mono text-xs">
+                    <div><span class="text-gray-500">X</span> <span class="text-emerald-200"><%= :erlang.float_to_binary(@imu_gx / 1, [decimals: 1]) %></span></div>
+                    <div><span class="text-gray-500">Y</span> <span class="text-emerald-200"><%= :erlang.float_to_binary(@imu_gy / 1, [decimals: 1]) %></span></div>
+                    <div><span class="text-gray-500">Z</span> <span class={"font-bold #{if abs(@imu_gz) > 5, do: "text-emerald-300", else: "text-emerald-200"}"}><%= :erlang.float_to_binary(@imu_gz / 1, [decimals: 1]) %></span></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          <% end %>
+
+          <%!-- Reactive autonomy panel --%>
+          <%= if @reactive_engine and @vision_active do %>
+            <div class="bg-gray-800 rounded-lg p-4 border border-emerald-500/30">
+              <h2 class="text-xl font-semibold mb-3 flex items-center gap-2">
+                Reactive Autonomy
+                <span class={"text-xs px-2 py-0.5 rounded-full #{vision_state_color(@vision_state)}"}>
+                  <%= vision_state_label(@vision_state) %>
+                </span>
+                <%= if @reactive_stop_zone_blocked do %>
+                  <span class="text-xs px-2 py-0.5 rounded-full bg-red-600 animate-pulse">BLOCKED</span>
+                <% end %>
+              </h2>
+              <div class="text-sm text-gray-300 space-y-3">
+                <%!-- Clearance bars (left / forward / right) --%>
+                <div>
+                  <span class="text-gray-400 text-xs">Clearance (meters)</span>
+                  <div class="flex gap-1 mt-1 h-6">
+                    <div class="flex-1 bg-gray-700 rounded-sm overflow-hidden relative">
+                      <div class={"h-full #{depth_bar_color(@reactive_clearance_left)} transition-all duration-150"} style={"width:#{depth_bar_width(@reactive_clearance_left)}%"}></div>
+                      <span class="absolute inset-0 flex items-center justify-center text-[10px] font-mono">L <%= :erlang.float_to_binary(@reactive_clearance_left / 1, [decimals: 2]) %>m</span>
+                    </div>
+                    <div class="flex-1 bg-gray-700 rounded-sm overflow-hidden relative">
+                      <div class={"h-full #{depth_bar_color(@reactive_clearance_fwd)} transition-all duration-150"} style={"width:#{depth_bar_width(@reactive_clearance_fwd)}%"}></div>
+                      <span class="absolute inset-0 flex items-center justify-center text-[10px] font-mono">Fwd <%= :erlang.float_to_binary(@reactive_clearance_fwd / 1, [decimals: 2]) %>m</span>
+                    </div>
+                    <div class="flex-1 bg-gray-700 rounded-sm overflow-hidden relative">
+                      <div class={"h-full #{depth_bar_color(@reactive_clearance_right)} transition-all duration-150"} style={"width:#{depth_bar_width(@reactive_clearance_right)}%"}></div>
+                      <span class="absolute inset-0 flex items-center justify-center text-[10px] font-mono">R <%= :erlang.float_to_binary(@reactive_clearance_right / 1, [decimals: 2]) %>m</span>
+                    </div>
+                  </div>
+                </div>
+                <%!-- Motor output --%>
+                <div class="grid grid-cols-2 gap-4">
+                  <div>
+                    <span class="text-gray-400 text-xs">Motor Output</span>
+                    <div class="flex gap-3 mt-1">
+                      <span class={"font-mono text-lg #{if @reactive_motor_left > 0, do: "text-green-400", else: if(@reactive_motor_left < 0, do: "text-red-400", else: "text-gray-500")}"}>
+                        L:<%= @reactive_motor_left %>
+                      </span>
+                      <span class={"font-mono text-lg #{if @reactive_motor_right > 0, do: "text-green-400", else: if(@reactive_motor_right < 0, do: "text-red-400", else: "text-gray-500")}"}>
+                        R:<%= @reactive_motor_right %>
+                      </span>
+                    </div>
+                  </div>
+                  <div>
+                    <span class="text-gray-400 text-xs">Stop Zone</span>
+                    <div class="mt-1">
+                      <span class={"font-mono #{if @reactive_stop_zone_blocked, do: "text-red-400", else: "text-green-400"}"}>
+                        <%= if @reactive_stop_zone_blocked, do: "BLOCKED", else: "Clear" %>
+                      </span>
+                      <span class="text-gray-500 text-xs ml-2">(<%= @reactive_stop_zone_count %> cells)</span>
+                    </div>
+                  </div>
+                </div>
+                <%!-- Current intent --%>
+                <div class="rounded bg-gray-900/70 border border-gray-700 px-3 py-2">
+                  <div class="text-[11px] uppercase tracking-wide text-gray-500 mb-1">Current Intent</div>
+                  <div class="text-sm text-blue-100"><%= @status_detail || "Waiting..." %></div>
+                </div>
+                <%!-- Pose / odometry row --%>
+                <%= if @reactive_pose_x do %>
+                  <div class="rounded bg-gray-900/70 border border-gray-700 px-3 py-2">
+                    <div class="text-[11px] uppercase tracking-wide text-gray-500 mb-1">Scan-Match Odometry</div>
+                    <div class="flex flex-wrap gap-4 text-sm">
+                      <span class="font-mono text-blue-200">x:<%= @reactive_pose_x %> y:<%= @reactive_pose_y %></span>
+                      <span class="font-mono text-blue-200">yaw:<%= @reactive_pose_yaw %>&deg;</span>
+                      <span class={"text-xs px-1.5 py-0.5 rounded #{if @reactive_pose_health == "healthy", do: "bg-green-700 text-green-100", else: if(@reactive_pose_health == "degraded", do: "bg-yellow-700 text-yellow-100", else: "bg-red-700 text-red-100")}"}>
+                        <%= @reactive_pose_health %>
+                      </span>
+                      <span class="text-gray-500 text-xs">map: <%= @reactive_map_cells %> cells</span>
+                    </div>
+                  </div>
+                <% end %>
+                <%!-- Stats row --%>
+                <div class="flex flex-wrap gap-4 text-xs text-gray-500">
+                  <span>Depth: <span class="font-mono"><%= :erlang.float_to_binary(@reactive_depth_ms / 1, [decimals: 0]) %>ms</span></span>
+                  <span>Tick: <span class="font-mono"><%= :erlang.float_to_binary(@reactive_total_ms / 1, [decimals: 1]) %>ms</span></span>
+                  <span>Points: <span class="font-mono"><%= @reactive_obstacle_points %></span></span>
+                  <span>US: <span class="font-mono"><%= if @reactive_ultrasonic_m, do: "#{:erlang.float_to_binary(@reactive_ultrasonic_m / 1, [decimals: 2])}m", else: "\u2014" %></span></span>
+                  <span>Frame: <span class="font-mono">#<%= @reactive_frame_count %></span></span>
+                </div>
+              </div>
+            </div>
+          <% end %>
+
+          <%!-- SLAM vision status panel (shown when SLAM engine is active, not reactive) --%>
+          <%= if @vision_active and not @reactive_engine or (not is_nil(@manual_ply_url)) or @force_live_ply do %>
             <div class="bg-gray-800 rounded-lg p-4 border border-blue-500/30">
               <h2 class="text-xl font-semibold mb-3 flex items-center gap-2">
                 Vision Autonomy

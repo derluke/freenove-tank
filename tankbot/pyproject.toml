@@ -16,6 +16,7 @@ robot = [
     "picamera2",
     "rpi-hardware-pwm",
     "lgpio",
+    "smbus2",
     "spidev",
 ]
 # Install on the desktop
@@ -44,6 +45,9 @@ tankbot-calibrate-camera = "tankbot.desktop.autonomy.calibrate_camera:main"
 tankbot-record-robot-stream = "tankbot.desktop.autonomy.record_robot_stream:main"
 tankbot-replay-slam-dataset = "tankbot.desktop.autonomy.replay_slam_dataset:main"
 tankbot-benchmark-depth = "tankbot.desktop.autonomy.benchmark_depth:main"
+tankbot-replay-reactive = "tankbot.desktop.autonomy.replay_reactive:main"
+tankbot-reactive = "tankbot.desktop.autonomy.reactive_engine:main"
+tankbot-replay-scanmatch = "tankbot.desktop.autonomy.replay_scanmatch:main"
 
 [build-system]
 requires = ["hatchling"]

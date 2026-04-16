@@ -24,10 +24,10 @@ from tankbot.desktop.autonomy.depth.base import (
     DepthResult,
 )
 
-# Default checkpoint — Large is the best-quality metric variant. If this is
-# too slow on target hardware, swap to `-Base-hf` or `-Small-hf` via the
-# TANKBOT_DEPTH_ANYTHING_V2_CHECKPOINT env var.
-DEFAULT_CHECKPOINT = "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf"
+# Default checkpoint — Base is the Phase 0b-selected variant (23 Hz on
+# RTX 4070 Ti SUPER). Large is higher quality but fails the 10 Hz gate.
+# Override via TANKBOT_DEPTH_ANYTHING_V2_CHECKPOINT env var if needed.
+DEFAULT_CHECKPOINT = "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf"
 CHECKPOINT_ENV = "TANKBOT_DEPTH_ANYTHING_V2_CHECKPOINT"
 
 

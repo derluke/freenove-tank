@@ -10,7 +10,7 @@ import socket
 import struct
 
 from tankbot.robot.config import RobotConfig
-from tankbot.robot.drivers import Camera, InfraredSensors, LedStrip, Motor, ServoController, Ultrasonic
+from tankbot.robot.drivers import Camera, Imu, InfraredSensors, LedStrip, Motor, ServoController, Ultrasonic
 from tankbot.robot.protocol.legacy_tcp import LegacyCmdServer, LegacyVideoServer
 from tankbot.robot.protocol.websocket_api import WebSocketAPI
 from tankbot.shared.protocol import CarMode, Cmd, LedEffect, Message
@@ -39,12 +39,14 @@ class Robot:
         self.infrared = InfraredSensors(self.cfg.pcb_version)
         self.led = LedStrip(self.cfg.pcb_version, self.cfg.pi_version)
         self.camera = Camera(stream_size=self.cfg.stream_size, hflip=True, vflip=True)
+        self.imu = Imu()
 
         # State
         self.car_mode = CarMode.MANUAL
         self.left_speed = 0
         self.right_speed = 0
         self.vision_status: dict | None = None  # latest from vision engine
+        self._latest_imu: dict | None = None
 
         # Servers
         self.legacy_cmd = LegacyCmdServer(on_message=self._handle_legacy_cmd)
@@ -187,6 +189,17 @@ class Robot:
         finally:
             self.camera.stop_stream()
 
+    async def _imu_loop(self) -> None:
+        """Poll the IMU at 50 Hz so telemetry always has a fresh reading."""
+        if not self.imu.available:
+            return
+        loop = asyncio.get_running_loop()
+        while self._running:
+            reading = await loop.run_in_executor(None, self.imu.read)
+            if reading is not None:
+                self._latest_imu = reading.as_dict()
+            await asyncio.sleep(0.02)
+
     async def _telemetry_loop(self) -> None:
         while self._running:
             distance = await asyncio.get_running_loop().run_in_executor(None, self.ultrasonic.get_distance)
@@ -195,15 +208,16 @@ class Robot:
                 await self.legacy_cmd.send_to_all(f"CMD_SONIC#{distance:.2f}")
             # Send to WS clients
             if self.ws_api.has_clients:
-                await self.ws_api.broadcast_telemetry(
-                    {
-                        "type": "telemetry",
-                        "distance": distance,
-                        "mode": self.car_mode.value,
-                        "motor": {"left": self.left_speed, "right": self.right_speed},
-                        "ir": await asyncio.get_running_loop().run_in_executor(None, self.infrared.read),
-                    }
-                )
+                payload = {
+                    "type": "telemetry",
+                    "distance": distance,
+                    "mode": self.car_mode.value,
+                    "motor": {"left": self.left_speed, "right": self.right_speed},
+                    "ir": await asyncio.get_running_loop().run_in_executor(None, self.infrared.read),
+                }
+                if self._latest_imu is not None:
+                    payload["imu"] = self._latest_imu
+                await self.ws_api.broadcast_telemetry(payload)
             await asyncio.sleep(1.0)
 
     async def _car_behavior_loop(self) -> None:
@@ -261,6 +275,7 @@ class Robot:
             asyncio.create_task(self._video_loop()),
             asyncio.create_task(self._telemetry_loop()),
             asyncio.create_task(self._car_behavior_loop()),
+            asyncio.create_task(self._imu_loop()),
         ]
 
         stop = asyncio.Event()
@@ -292,6 +307,7 @@ class Robot:
         self.servo.close()
         self.ultrasonic.close()
         self.infrared.close()
+        self.imu.close()
         log.info("Robot shut down cleanly")
 
 
