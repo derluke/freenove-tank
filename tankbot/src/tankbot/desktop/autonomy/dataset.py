@@ -8,10 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, TextIO, cast
 
-DATASET_SCHEMA_VERSION = 1
+DATASET_SCHEMA_VERSION = 2
 MANIFEST_NAME = "manifest.json"
 FRAME_LOG_NAME = "frames.jsonl"
 TELEMETRY_LOG_NAME = "telemetry.jsonl"
+IMU_LOG_NAME = "imu.jsonl"
 
 
 @dataclass(frozen=True)
@@ -30,10 +31,22 @@ class TelemetryRecord:
 
 
 @dataclass(frozen=True)
-class DatasetEvent:
-    channel: Literal["frame", "telemetry"]
+class ImuRecord:
     t_monotonic: float
-    payload: FrameRecord | TelemetryRecord
+    t_wall: float
+    gz: float
+    gx: float = 0.0
+    gy: float = 0.0
+    ax: float = 0.0
+    ay: float = 0.0
+    az: float = 0.0
+
+
+@dataclass(frozen=True)
+class DatasetEvent:
+    channel: Literal["frame", "telemetry", "imu"]
+    t_monotonic: float
+    payload: FrameRecord | TelemetryRecord | ImuRecord
 
 
 @dataclass(frozen=True)
@@ -50,10 +63,12 @@ class DatasetWriter:
         self._cli_args = cli_args or {}
         self._frame_log = output_dir / FRAME_LOG_NAME
         self._telemetry_log = output_dir / TELEMETRY_LOG_NAME
+        self._imu_log = output_dir / IMU_LOG_NAME
         self._manifest_path = output_dir / MANIFEST_NAME
         existing_counts = manifest.get("counts", {}) if isinstance(manifest, dict) else {}
         self._frames_written = int(existing_counts.get("frames", 0))
         self._telemetry_written = int(existing_counts.get("telemetry", 0))
+        self._imu_written = int(existing_counts.get("imu", 0))
         self._started_monotonic = (
             float(manifest["started_monotonic"])
             if isinstance(manifest, dict) and manifest.get("started_monotonic") is not None
@@ -66,11 +81,13 @@ class DatasetWriter:
         )
         self._frame_fp: TextIO | None = None
         self._telemetry_fp: TextIO | None = None
+        self._imu_fp: TextIO | None = None
 
     def open(self) -> None:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._frame_fp = self._frame_log.open("a", encoding="utf-8")
         self._telemetry_fp = self._telemetry_log.open("a", encoding="utf-8")
+        self._imu_fp = self._imu_log.open("a", encoding="utf-8")
         self._write_manifest(status="recording")
 
     def write_frame(self, *, frame_index: int, t_monotonic: float, t_wall: float) -> Path:
@@ -100,6 +117,23 @@ class DatasetWriter:
         )
         self._telemetry_written += 1
 
+    def write_imu(self, payload: dict[str, Any], *, t_monotonic: float, t_wall: float) -> None:
+        self._set_start_times(t_monotonic=t_monotonic, t_wall=t_wall)
+        self._write_json_line(
+            self._imu_fp,
+            {
+                "t_monotonic": t_monotonic,
+                "t_wall": t_wall,
+                "gz": payload.get("gz", 0.0),
+                "gx": payload.get("gx", 0.0),
+                "gy": payload.get("gy", 0.0),
+                "ax": payload.get("ax", 0.0),
+                "ay": payload.get("ay", 0.0),
+                "az": payload.get("az", 0.0),
+            },
+        )
+        self._imu_written += 1
+
     def close(self, *, status: str = "complete") -> None:
         if self._frame_fp is not None:
             self._frame_fp.close()
@@ -107,6 +141,9 @@ class DatasetWriter:
         if self._telemetry_fp is not None:
             self._telemetry_fp.close()
             self._telemetry_fp = None
+        if self._imu_fp is not None:
+            self._imu_fp.close()
+            self._imu_fp = None
         self._write_manifest(status=status)
 
     def _set_start_times(self, *, t_monotonic: float, t_wall: float) -> None:
@@ -132,10 +169,17 @@ class DatasetWriter:
                     "timestamp": "t_monotonic",
                     "payload": "robot websocket telemetry payload",
                 },
+                "imu": {
+                    "jsonl": IMU_LOG_NAME,
+                    "timestamp": "t_monotonic",
+                    "rate_hz": 50,
+                    "fields": ["gz", "gx", "gy", "ax", "ay", "az"],
+                },
             },
             "counts": {
                 "frames": self._frames_written,
                 "telemetry": self._telemetry_written,
+                "imu": self._imu_written,
             },
             "started_monotonic": self._started_monotonic,
             "started_wall": self._started_wall,
@@ -213,24 +257,62 @@ def iter_telemetry_records(dataset_dir: Path) -> Iterator[TelemetryRecord]:
             )
 
 
+def iter_imu_records(dataset_dir: Path) -> Iterator[ImuRecord]:
+    imu_path = dataset_dir / IMU_LOG_NAME
+    if not imu_path.exists():
+        return
+    with imu_path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            yield ImuRecord(
+                t_monotonic=float(row["t_monotonic"]),
+                t_wall=float(row["t_wall"]),
+                gz=float(row.get("gz", 0.0)),
+                gx=float(row.get("gx", 0.0)),
+                gy=float(row.get("gy", 0.0)),
+                ax=float(row.get("ax", 0.0)),
+                ay=float(row.get("ay", 0.0)),
+                az=float(row.get("az", 0.0)),
+            )
+
+
 def iter_dataset_events(dataset_dir: Path) -> Iterator[DatasetEvent]:
     frame_iter = iter_frame_records(dataset_dir)
     telemetry_iter = iter_telemetry_records(dataset_dir)
+    imu_iter = iter_imu_records(dataset_dir)
 
     next_frame = next(frame_iter, None)
     next_telemetry = next(telemetry_iter, None)
+    next_imu = next(imu_iter, None)
 
-    while next_frame is not None or next_telemetry is not None:
-        if next_telemetry is None or (next_frame is not None and next_frame.t_monotonic <= next_telemetry.t_monotonic):
-            frame = next_frame
-            if frame is None:
-                break
-            yield DatasetEvent(channel="frame", t_monotonic=frame.t_monotonic, payload=frame)
+    while next_frame is not None or next_telemetry is not None or next_imu is not None:
+        # Pick the event with the earliest timestamp.
+        candidates: list[tuple[float, str]] = []
+        if next_frame is not None:
+            candidates.append((next_frame.t_monotonic, "frame"))
+        if next_telemetry is not None:
+            candidates.append((next_telemetry.t_monotonic, "telemetry"))
+        if next_imu is not None:
+            candidates.append((next_imu.t_monotonic, "imu"))
+
+        if not candidates:
+            break
+        _, channel = min(candidates, key=lambda c: c[0])
+
+        if channel == "frame":
+            assert next_frame is not None
+            yield DatasetEvent(channel="frame", t_monotonic=next_frame.t_monotonic, payload=next_frame)
             next_frame = next(frame_iter, None)
-            continue
-
-        yield DatasetEvent(channel="telemetry", t_monotonic=next_telemetry.t_monotonic, payload=next_telemetry)
-        next_telemetry = next(telemetry_iter, None)
+        elif channel == "telemetry":
+            assert next_telemetry is not None
+            yield DatasetEvent(channel="telemetry", t_monotonic=next_telemetry.t_monotonic, payload=next_telemetry)
+            next_telemetry = next(telemetry_iter, None)
+        else:
+            assert next_imu is not None
+            yield DatasetEvent(channel="imu", t_monotonic=next_imu.t_monotonic, payload=next_imu)
+            next_imu = next(imu_iter, None)
 
 
 def iter_frame_ticks(dataset_dir: Path) -> Iterator[FrameTick]:

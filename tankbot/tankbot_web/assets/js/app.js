@@ -27,6 +27,7 @@ import topbar from "../vendor/topbar"
 import { Blockly as BlocklyHook, RunBlockly } from "./hooks/blockly_hook"
 import { DriveControls } from "./hooks/drive_hook"
 import { SplatViewer } from "./hooks/splat_hook"
+import { MapZoom } from "./hooks/map_zoom_hook"
 
 const Hooks = {
   ...colocatedHooks,
@@ -34,6 +35,7 @@ const Hooks = {
   RunBlockly: RunBlockly,
   DriveControls: DriveControls,
   SplatViewer: SplatViewer,
+  MapZoom: MapZoom,
 }
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")

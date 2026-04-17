@@ -50,10 +50,18 @@ class FrameRecorder:
             t_wall=time.time(),
         )
 
+    async def _on_imu(self, data: dict[str, Any]) -> None:
+        self._dataset.write_imu(
+            data,
+            t_monotonic=time.monotonic(),
+            t_wall=time.time(),
+        )
+
     async def connect(self) -> None:
         self._dataset.open()
         self._client.on_frame(self._on_frame)
         self._client.on_telemetry(self._on_telemetry)
+        self._client.on_imu(self._on_imu)
         await self._client.connect()
 
     async def listen(self) -> None:

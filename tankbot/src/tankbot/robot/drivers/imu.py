@@ -5,8 +5,27 @@ Default config:
   gyro:  +/-250   dps (131 LSB/dps)
   DLPF:  ~42 Hz   low-pass (register 0x1A = 3)
 
-Reads are cheap (~1 ms burst read); safe to poll at 50-100 Hz later
-when we wire gyro-Z into the scan-match rotation prior.
+Reads are cheap (~1 ms burst read); safe to poll at 50-100 Hz for
+feeding a gyro-Z yaw integrator into the scan-match rotation prior.
+
+Calibration
+-----------
+The part has non-trivial zero-rate bias (datasheet allows ±20 dps on
+gyro) and ~±5% accel full-scale tolerance. Two corrections are applied:
+
+1. **Startup bias**: sample ~2 s at rest, take the mean for each axis.
+   Subtracted from gyro readings; accel X/Y get the same treatment so
+   they read ~0 when flat. Accel Z is scaled so that it reads exactly
+   1 g at rest (orientation permitting — see below).
+2. **Adaptive bias**: once calibrated, when the caller tells us we're
+   stationary (`mark_stationary()`), we slowly blend the live gyro mean
+   into the bias to track thermal drift.
+
+Orientation: on the tank, the board sits upright with +Z pointing
+roughly up. At rest accel should therefore read roughly (0, 0, +1g).
+If the board is mounted sideways or inverted, the Z-scale correction
+will be wrong — but gyro integration for yaw only needs gx/gy/gz
+biases, which are axis-agnostic.
 
 Degrades gracefully: if smbus2 is missing or the chip doesn't ACK,
 `available` stays False and `read()` returns None.
@@ -16,6 +35,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +52,12 @@ _ACCEL_XOUT_H = 0x3B  # 14 bytes: ax,ay,az,temp,gx,gy,gz
 
 _ACCEL_LSB_PER_G = 16384.0
 _GYRO_LSB_PER_DPS = 131.0
+
+# Calibration defaults
+_CALIB_DURATION_S = 2.0
+_CALIB_RATE_HZ = 100.0
+# Adaptive update blend when stationary: bias += alpha * (live - bias)
+_ADAPTIVE_ALPHA = 0.01
 
 
 class ImuReading:
@@ -59,9 +85,16 @@ class ImuReading:
 
 
 class Imu:
-    def __init__(self) -> None:
+    def __init__(self, *, calibrate: bool = True) -> None:
         self._bus = None
         self._available = False
+
+        # Calibration offsets (subtracted from raw). None while uncalibrated.
+        self._gyro_bias = [0.0, 0.0, 0.0]
+        self._accel_bias_xy = [0.0, 0.0]
+        self._accel_z_scale = 1.0
+        self._calibrated = False
+
         try:
             from smbus2 import SMBus
 
@@ -81,12 +114,86 @@ class Imu:
             log.info("IMU ready (MPU-6050 @ 0x68 on bus %d)", _BUS)
         except Exception as exc:
             log.warning("IMU unavailable: %s", exc)
+            return
+
+        if calibrate:
+            self.calibrate()
 
     @property
     def available(self) -> bool:
         return self._available
 
-    def read(self) -> ImuReading | None:
+    @property
+    def calibrated(self) -> bool:
+        return self._calibrated
+
+    def calibrate(self, duration_s: float = _CALIB_DURATION_S, rate_hz: float = _CALIB_RATE_HZ) -> bool:
+        """Block for ~duration_s sampling at rest, capture gyro/accel bias.
+
+        Caller must keep the robot perfectly still during this window.
+        Returns True on success.
+        """
+        if not self._available:
+            return False
+
+        period = 1.0 / rate_hz
+        n_target = max(10, int(duration_s * rate_hz))
+
+        gx_sum = gy_sum = gz_sum = 0.0
+        ax_sum = ay_sum = az_sum = 0.0
+        n = 0
+        deadline = time.monotonic() + duration_s
+        while time.monotonic() < deadline and n < n_target * 2:
+            r = self._raw_read()
+            if r is not None:
+                ax, ay, az, gx, gy, gz, _ = r
+                ax_sum += ax
+                ay_sum += ay
+                az_sum += az
+                gx_sum += gx
+                gy_sum += gy
+                gz_sum += gz
+                n += 1
+            time.sleep(period)
+
+        if n < 10:
+            log.warning("IMU calibration failed: only %d samples", n)
+            return False
+
+        self._gyro_bias = [gx_sum / n, gy_sum / n, gz_sum / n]
+        self._accel_bias_xy = [ax_sum / n, ay_sum / n]
+        az_mean = az_sum / n
+        # Assume +Z is up at rest; compensate scale so az reads exactly 1 g.
+        self._accel_z_scale = (1.0 / az_mean) if abs(az_mean) > 0.1 else 1.0
+        self._calibrated = True
+        log.info(
+            "IMU calibrated (n=%d): gyro_bias=(%.2f,%.2f,%.2f) dps, accel_xy_bias=(%.3f,%.3f) g, az_scale=%.4f",
+            n,
+            self._gyro_bias[0],
+            self._gyro_bias[1],
+            self._gyro_bias[2],
+            self._accel_bias_xy[0],
+            self._accel_bias_xy[1],
+            self._accel_z_scale,
+        )
+        return True
+
+    def mark_stationary(self, reading: ImuReading) -> None:
+        """Caller signals the robot is stationary; blend this reading into bias.
+
+        Use this when motors are idle and measured gyro is tiny — lets the
+        bias track thermal drift without interrupting normal operation.
+        """
+        if not self._calibrated:
+            return
+        # The passed-in reading is already bias-corrected, so it represents
+        # residual error. Blend a small fraction back into the bias.
+        self._gyro_bias[0] += _ADAPTIVE_ALPHA * reading.gx
+        self._gyro_bias[1] += _ADAPTIVE_ALPHA * reading.gy
+        self._gyro_bias[2] += _ADAPTIVE_ALPHA * reading.gz
+
+    def _raw_read(self) -> tuple[float, float, float, float, float, float, float] | None:
+        """Return raw (ax, ay, az, gx, gy, gz, temp_c) without calibration."""
         if not self._available or self._bus is None:
             return None
         try:
@@ -106,7 +213,22 @@ class Imu:
         gx = s16(data[8], data[9]) / _GYRO_LSB_PER_DPS
         gy = s16(data[10], data[11]) / _GYRO_LSB_PER_DPS
         gz = s16(data[12], data[13]) / _GYRO_LSB_PER_DPS
-        return ImuReading(ax, ay, az, gx, gy, gz, temp)
+        return ax, ay, az, gx, gy, gz, temp
+
+    def read(self) -> ImuReading | None:
+        r = self._raw_read()
+        if r is None:
+            return None
+        ax, ay, az, gx, gy, gz, temp = r
+        return ImuReading(
+            ax=ax - self._accel_bias_xy[0],
+            ay=ay - self._accel_bias_xy[1],
+            az=az * self._accel_z_scale,
+            gx=gx - self._gyro_bias[0],
+            gy=gy - self._gyro_bias[1],
+            gz=gz - self._gyro_bias[2],
+            temp_c=temp,
+        )
 
     def close(self) -> None:
         if self._bus is not None:

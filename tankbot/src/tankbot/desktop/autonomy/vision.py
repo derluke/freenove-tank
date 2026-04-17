@@ -24,7 +24,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 
 from tankbot.desktop.autonomy.frontier import FrontierPlanner, PlannerMode
@@ -122,7 +122,7 @@ MIN_STATE_DURATION = {
 PLY_EXPORT_INTERVAL = 5.0  # seconds between PLY exports
 
 
-class State(str, Enum):
+class State(StrEnum):
     SCANNING = "scanning"
     CRUISING = "cruising"
     AVOIDING = "avoiding"
@@ -130,7 +130,7 @@ class State(str, Enum):
     STOPPED = "stopped"
 
 
-class ControlPhase(str, Enum):
+class ControlPhase(StrEnum):
     BOOTSTRAP = "bootstrap"
     INITIAL_SCAN = "initial_scan"
     NAVIGATING = "navigating"

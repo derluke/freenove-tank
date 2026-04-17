@@ -13,16 +13,18 @@ exceeds `keyframe_dist_m` (or rotation exceeds `keyframe_yaw_rad`),
 the current scan becomes the new keyframe. This gives ICP a larger,
 resolvable displacement to work with.
 
-Health transitions:
-- HEALTHY: scan match converges with mean residual below threshold.
-- DEGRADED: residual elevated or correspondence count low for a few
-  ticks. `xy_m` still reported but `xy_var` inflated.
-- BROKEN: N consecutive degraded ticks. `xy_m` reverts to None.
-  Recovery requires N_healthy consecutive good matches.
+IMU integration (Phase 2b):
+When `gyro_yaw` is provided, the gyro is the **authoritative** rotation
+source. The scan-match ICP receives a strong rotation prior so it only
+solves for translation. The accumulated yaw comes directly from the
+gyro integrator, not from the scan match. This eliminates the wild
+heading jumps that monocular-depth scan matching produces.
 
-Without IMU (Phase 2 initial): rotation comes from the scan match
-itself. With IMU (future): gyro provides a rotation prior, scan match
-refines translation.
+Motor gating:
+When the caller signals `motors_active=False`, the pose is frozen —
+scan matching still runs for keyframe bookkeeping, but the published
+pose does not change. This eliminates phantom drift from scan-match
+noise when the robot is stationary.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from tankbot.desktop.autonomy.reactive.gyro import unwrap_delta
 from tankbot.desktop.autonomy.reactive.pose import (
     HealthState,
     PoseEstimate,
@@ -52,67 +55,52 @@ class ScanMatchConfig:
     """Tunables for the scan-match pose source."""
 
     residual_healthy: float = 0.03
-    """Mean residual below this = HEALTHY match (meters). Tight
-    threshold — only high-confidence matches update the pose."""
+    """Mean residual below this = HEALTHY match (meters)."""
 
     residual_degraded: float = 0.08
-    """Mean residual above this = degraded match. Between healthy and
-    degraded is a gray zone that counts toward degradation."""
+    """Mean residual above this = degraded match."""
 
     min_correspondences: int = 20
-    """Below this, the match is considered unreliable regardless of
-    residual."""
+    """Below this, the match is considered unreliable."""
 
     degraded_to_broken_frames: int = 10
-    """Consecutive degraded/failed frames before transitioning to BROKEN."""
+    """Consecutive degraded/failed frames before BROKEN."""
 
     broken_to_healthy_frames: int = 5
-    """Consecutive healthy frames required to recover from BROKEN."""
+    """Consecutive healthy frames to recover from BROKEN."""
 
-    max_delta_m: float = 0.30
-    """Reject scan-match deltas larger than this since the keyframe."""
+    max_delta_m: float = 0.20
+    """Reject ICP translation deltas larger than this since keyframe."""
 
-    max_delta_yaw: float = 0.50
-    """Reject scan-match rotation deltas larger than this since the
-    keyframe (radians, ~28 deg)."""
+    max_delta_yaw: float = 0.35
+    """Reject ICP rotation deltas larger than this since keyframe
+    (radians, ~20 deg). Only used when gyro is unavailable."""
 
     keyframe_dist_m: float = 0.15
-    """Promote current scan to keyframe when accumulated translation
-    since the last keyframe exceeds this (meters). Larger = fewer
-    keyframe switches = less noise accumulation."""
+    """Promote keyframe when translation exceeds this (meters)."""
 
     keyframe_yaw_rad: float = 0.20
-    """Promote current scan to keyframe when accumulated rotation
-    since the last keyframe exceeds this (radians, ~11 deg)."""
+    """Promote keyframe when rotation exceeds this (radians, ~11 deg)."""
 
     keyframe_max_frames: int = 60
-    """Force keyframe promotion after this many frames even if the
-    displacement threshold hasn't been reached. Prevents the reference
-    from going stale."""
+    """Force keyframe promotion after this many frames."""
 
     xy_var_healthy: float = 0.01
-    """Reported xy variance when healthy (m^2)."""
-
     xy_var_degraded: float = 0.10
-    """Reported xy variance when degraded (m^2)."""
-
     yaw_var_base: float = 0.001
-    """Base yaw variance (rad^2)."""
 
-    pose_ema_alpha: float = 0.25
-    """EMA smoothing factor for the published pose. Lower = smoother
-    but slower to track real motion. 0.25 at 23 Hz gives ~170 ms
-    effective time constant — enough to kill per-frame jitter while
-    tracking cruise-speed motion."""
+    pose_ema_alpha: float = 0.15
+    """EMA smoothing for published pose. 0.15 at 23 Hz gives ~280 ms
+    effective time constant — trades a bit of responsiveness for much
+    smoother map rendering."""
 
 
 class ScanMatchPoseSource(PoseSource):
     """Pose source using keyframe-based depth scan matching.
 
-    Feed it robot-frame 3D points each tick via `update()`. It extracts
-    a synthetic 2D scan, matches against a keyframe reference scan, and
-    accumulates the pose. The keyframe is promoted when accumulated
-    displacement exceeds the configured thresholds.
+    When gyro_yaw is provided, the gyro is authoritative for rotation
+    and scan-match only contributes translation. When gyro is absent,
+    scan-match provides both rotation and translation (noisier).
     """
 
     source_name = "scan_match"
@@ -130,7 +118,7 @@ class ScanMatchPoseSource(PoseSource):
         self._cfg = config or ScanMatchConfig()
         self._clock = clock
 
-        # Accumulated world-frame pose (raw, from ICP).
+        # Accumulated world-frame pose.
         self._x: float = 0.0
         self._y: float = 0.0
         self._yaw: float = 0.0
@@ -150,6 +138,7 @@ class ScanMatchPoseSource(PoseSource):
         self._keyframe_x: float = 0.0
         self._keyframe_y: float = 0.0
         self._keyframe_yaw: float = 0.0
+        self._keyframe_gyro_yaw: float | None = None
         self._frames_since_keyframe: int = 0
 
         # Latest estimate (returned by latest()).
@@ -163,7 +152,6 @@ class ScanMatchPoseSource(PoseSource):
             source=self.source_name,
         )
 
-        # Last match result for debugging/replay.
         self._last_match: MatchResult | None = None
 
     def latest(self) -> PoseEstimate:
@@ -171,7 +159,6 @@ class ScanMatchPoseSource(PoseSource):
 
     @property
     def last_match(self) -> MatchResult | None:
-        """Most recent ICP match result, for debugging/visualization."""
         return self._last_match
 
     def update(
@@ -179,6 +166,8 @@ class ScanMatchPoseSource(PoseSource):
         points_xyz: np.ndarray,
         *,
         rotation_prior: float | None = None,
+        gyro_yaw: float | None = None,
+        motors_active: bool = True,
     ) -> MatchResult | None:
         """Feed a new frame of robot-frame 3D points.
 
@@ -187,22 +176,22 @@ class ScanMatchPoseSource(PoseSource):
         points_xyz
             (N, 3) robot-frame points from depth projection.
         rotation_prior
-            Optional gyro-derived rotation since last keyframe (radians).
-            When IMU is available, pass the integrated gyro delta here.
-
-        Returns
-        -------
-        MatchResult or None
-            The ICP result, or None if this was the first frame.
+            Pre-computed rotation-since-keyframe prior (radians).
+            Most callers should pass `gyro_yaw` instead.
+        gyro_yaw
+            Absolute integrated gyro yaw (radians, CCW positive). When
+            provided, the gyro is the **authoritative** rotation source.
+        motors_active
+            False when motors are stopped. Pose is frozen to prevent
+            scan-match noise from drifting the position at rest.
         """
         now = self._clock()
 
-        # Extract synthetic scan.
         scan = extract_scan(points_xyz, self._scan_cfg)
 
         if self._keyframe_scan is None:
-            # First frame — set as keyframe.
             self._keyframe_scan = scan
+            self._keyframe_gyro_yaw = gyro_yaw
             self._latest = PoseEstimate(
                 t_monotonic=now,
                 yaw_rad=0.0,
@@ -216,6 +205,13 @@ class ScanMatchPoseSource(PoseSource):
 
         self._frames_since_keyframe += 1
 
+        # Derive rotation prior from absolute gyro yaw.
+        gyro_delta: float | None = None
+        if gyro_yaw is not None and self._keyframe_gyro_yaw is not None:
+            gyro_delta = unwrap_delta(gyro_yaw - self._keyframe_gyro_yaw)
+        if rotation_prior is None:
+            rotation_prior = gyro_delta
+
         # Match current scan against keyframe.
         result = match_scans(
             source=scan,
@@ -225,40 +221,64 @@ class ScanMatchPoseSource(PoseSource):
         )
         self._last_match = result
 
-        # Evaluate match quality.
+        # --- Rotation: gyro is authoritative, applied unconditionally ---
+        # This is independent of scan-match quality. Even when ICP fails
+        # (which is common with monocular depth), the heading tracks reality.
+        # Gyro yaw bypasses EMA — the hardware DLPF already smooths it.
+        gyro_authoritative = False
+        if gyro_delta is not None and motors_active:
+            self._yaw = self._keyframe_yaw + gyro_delta
+            self._yaw_smooth = self._yaw
+            gyro_authoritative = True
+
+        # --- Translation: only from good scan-match when motors are active ---
+        if not motors_active:
+            if self._frames_since_keyframe >= self._cfg.keyframe_max_frames:
+                self._promote_keyframe(scan, gyro_yaw)
+            self._update_smoothed(now)
+            return result
+
         good = self._evaluate_match(result)
 
         if good:
-            # Sanity check on delta magnitude.
             delta_m = math.hypot(result.dx, result.dy)
-            if delta_m > self._cfg.max_delta_m or abs(result.dyaw) > self._cfg.max_delta_yaw:
+            yaw_too_big = gyro_delta is None and abs(result.dyaw) > self._cfg.max_delta_yaw
+            if delta_m > self._cfg.max_delta_m or yaw_too_big:
                 self._mark_degraded()
             else:
-                # The ICP result is the transform from keyframe to current.
-                # Compute new absolute pose = keyframe pose + delta.
                 cos_k = math.cos(self._keyframe_yaw)
                 sin_k = math.sin(self._keyframe_yaw)
                 self._x = self._keyframe_x + cos_k * result.dx - sin_k * result.dy
                 self._y = self._keyframe_y + sin_k * result.dx + cos_k * result.dy
-                self._yaw = self._keyframe_yaw + result.dyaw
-                self._mark_healthy()
 
-                # Check if we should promote to a new keyframe.
-                self._maybe_promote_keyframe(scan, delta_m, abs(result.dyaw))
+                # If no gyro, also take rotation from scan-match.
+                if gyro_delta is None:
+                    self._yaw = self._keyframe_yaw + result.dyaw
+
+                self._mark_healthy()
+                self._maybe_promote_keyframe(scan, delta_m, abs(gyro_delta or result.dyaw), gyro_yaw)
         else:
             self._mark_degraded()
-            # If the match failed and we're far from the keyframe,
-            # force a keyframe reset to avoid accumulating stale error.
-            if self._frames_since_keyframe > self._cfg.keyframe_max_frames:
-                self._promote_keyframe(scan)
+            # Promote keyframe on gyro rotation even when ICP fails,
+            # so the reference scan stays aligned with reality.
+            yaw_since_kf = abs(gyro_delta) if gyro_delta is not None else 0.0
+            if (
+                self._frames_since_keyframe > self._cfg.keyframe_max_frames
+                or yaw_since_kf > self._cfg.keyframe_yaw_rad
+            ):
+                self._promote_keyframe(scan, gyro_yaw)
 
-        # EMA-smooth the raw pose to kill per-frame jitter.
+        self._update_smoothed(now, skip_yaw_ema=gyro_authoritative)
+        return result
+
+    def _update_smoothed(self, now: float, *, skip_yaw_ema: bool = False) -> None:
+        """Apply EMA smoothing and publish the pose estimate."""
         a = self._cfg.pose_ema_alpha
         self._x_smooth += a * (self._x - self._x_smooth)
         self._y_smooth += a * (self._y - self._y_smooth)
-        self._yaw_smooth += a * (self._yaw - self._yaw_smooth)
+        if not skip_yaw_ema:
+            self._yaw_smooth += a * (self._yaw - self._yaw_smooth)
 
-        # Build the pose estimate from smoothed values.
         if self._health == HealthState.BROKEN:
             xy_m = None
             xy_var = None
@@ -278,27 +298,26 @@ class ScanMatchPoseSource(PoseSource):
             health=self._health,
             source=self.source_name,
         )
-        return result
 
-    def _maybe_promote_keyframe(self, scan: Scan2D, delta_m: float, delta_yaw: float) -> None:
-        """Promote current scan to keyframe if displacement is large enough."""
+    def _maybe_promote_keyframe(
+        self, scan: Scan2D, delta_m: float, delta_yaw: float, gyro_yaw: float | None
+    ) -> None:
         if (
             delta_m >= self._cfg.keyframe_dist_m
             or delta_yaw >= self._cfg.keyframe_yaw_rad
             or self._frames_since_keyframe >= self._cfg.keyframe_max_frames
         ):
-            self._promote_keyframe(scan)
+            self._promote_keyframe(scan, gyro_yaw)
 
-    def _promote_keyframe(self, scan: Scan2D) -> None:
-        """Set the current scan as the new keyframe reference."""
+    def _promote_keyframe(self, scan: Scan2D, gyro_yaw: float | None) -> None:
         self._keyframe_scan = scan
         self._keyframe_x = self._x
         self._keyframe_y = self._y
         self._keyframe_yaw = self._yaw
+        self._keyframe_gyro_yaw = gyro_yaw
         self._frames_since_keyframe = 0
 
     def _evaluate_match(self, result: MatchResult) -> bool:
-        """Return True if the match is good enough to use."""
         if not result.converged:
             return False
         if result.n_correspondences < self._cfg.min_correspondences:
@@ -314,7 +333,6 @@ class ScanMatchPoseSource(PoseSource):
                 self._consecutive_healthy = 0
         elif self._health == HealthState.DEGRADED:
             self._health = HealthState.HEALTHY
-        # Already HEALTHY — no-op.
 
     def _mark_degraded(self) -> None:
         self._consecutive_healthy = 0
@@ -325,7 +343,6 @@ class ScanMatchPoseSource(PoseSource):
             self._health = HealthState.BROKEN
 
     def reset(self) -> None:
-        """Reset accumulated pose and health state."""
         self._x = 0.0
         self._y = 0.0
         self._yaw = 0.0
@@ -339,5 +356,6 @@ class ScanMatchPoseSource(PoseSource):
         self._keyframe_x = 0.0
         self._keyframe_y = 0.0
         self._keyframe_yaw = 0.0
+        self._keyframe_gyro_yaw = None
         self._frames_since_keyframe = 0
         self._last_match = None

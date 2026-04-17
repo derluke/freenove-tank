@@ -75,10 +75,12 @@ class ICPConfig:
     """Minimum number of valid bins in both scans to attempt matching.
     Below this, the scan is too sparse for reliable matching."""
 
-    rotation_prior_weight: float = 5.0
+    rotation_prior_weight: float = 20.0
     """When a gyro rotation prior is provided, this weight (relative to
-    unit data weight) penalizes deviation from the prior. Higher values
-    make the ICP trust the gyro more. Set to 0 to disable the prior."""
+    unit data weight) penalizes deviation from the prior. At 20.0, the
+    ICP essentially locks rotation to the gyro and solves for translation
+    only — appropriate since gyro is far more reliable than monocular
+    depth scan geometry for rotation."""
 
 
 def _build_kd_pairs(

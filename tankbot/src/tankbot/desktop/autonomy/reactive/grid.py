@@ -46,9 +46,10 @@ class StopZoneQuery:
     """Half-angle of the forward wedge. 30 deg -> 60 deg total FOV for
     the stop check."""
 
-    min_occupied_cells: int = 2
-    """Require at least this many occupied cells before vetoing -- one
-    stray cell from depth noise should not halt the robot."""
+    min_occupied_cells: int = 4
+    """Require at least this many occupied cells before vetoing.
+    At 5cm resolution, 4 cells ≈ 20cm of obstacle — enough to filter
+    single-pixel depth noise while still catching real obstacles."""
 
 
 class ReactiveGrid:

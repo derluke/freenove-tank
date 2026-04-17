@@ -36,6 +36,7 @@ from tankbot.desktop.autonomy.reactive import (
     load_extrinsics,
     load_intrinsics,
 )
+from tankbot.desktop.autonomy.reactive.gyro import GyroIntegrator
 from tankbot.desktop.autonomy.reactive.policy import PolicyDecision, WanderState
 from tankbot.desktop.autonomy.reactive.pose import HealthState
 from tankbot.desktop.autonomy.reactive.projection import (
@@ -63,7 +64,7 @@ class ReactiveEngine:
         depth_backend: str = "depth_anything_v2",
         intrinsics_path: str = "calibration/camera_intrinsics.yaml",
         extrinsics_path: str = "calibration/camera_extrinsics.yaml",
-        depth_scale: float = 1.0,
+        depth_scale: float = 0.56,
     ) -> None:
         robot_url = robot_url or os.environ.get("ROBOT_URL", "ws://localhost:9000")
         self._client = RobotClient(robot_url)
@@ -81,6 +82,21 @@ class ReactiveEngine:
         # LED state to avoid spamming.
         self._last_led_payload: tuple | None = None
 
+        # Gyro integration — only marked "active" once we've received samples.
+        self._gyro = GyroIntegrator()
+        self._imu_active = False
+
+        # Track last motor command to gate pose updates.
+        self._motors_active = False
+        self._last_left_duty = 0
+        self._last_right_duty = 0
+
+        # Dead-reckoning position: advances every frame using motor duty
+        # + gyro heading. Scan-match corrections blend in when healthy.
+        self._dr_x: float = 0.0
+        self._dr_y: float = 0.0
+        self._dr_last_t: float | None = None
+
     # ------------------------------------------------------------------
     # Callbacks
     # ------------------------------------------------------------------
@@ -89,6 +105,16 @@ class ReactiveEngine:
 
     async def _on_telemetry(self, data: dict) -> None:
         self._latest_telemetry = data
+
+    async def _on_imu(self, data: dict) -> None:
+        """High-rate IMU callback — accumulate gyro-Z into a yaw estimate."""
+        gz = data.get("gz")
+        if gz is None:
+            return
+        self._gyro.add_sample(float(gz))
+        if not self._imu_active:
+            self._imu_active = True
+            log.info("IMU stream active — gyro-Z prior will feed scan-match")
 
     # ------------------------------------------------------------------
     # Setup
@@ -108,7 +134,7 @@ class ReactiveEngine:
 
         # Phase 2: scan-match pose source for odometry + world map.
         self._pose_source = ScanMatchPoseSource()
-        self._world_map = WorldMap(render_size_px=320)
+        self._world_map = WorldMap(render_size_px=480)
 
         self._safety = ReactiveSafety(
             intrinsics=self._intrinsics,
@@ -131,6 +157,32 @@ class ReactiveEngine:
         if not isinstance(raw_cm, (int, float)) or raw_cm <= 0 or raw_cm > _US_MAX_TRUSTED_CM:
             return None
         return float(raw_cm) / 100.0
+
+    # Motor duty → forward speed (m/s) rough model.
+    # Below MIN_DUTY (1000) treads don't move.
+    _MIN_DUTY = 1000
+    _SPEED_PER_DUTY = 0.00015  # ~0.15 m/s at duty 2000
+
+    def _dead_reckon(self, now: float, yaw: float) -> None:
+        """Advance DR position using motor duty + heading."""
+        if self._dr_last_t is None:
+            self._dr_last_t = now
+            return
+        dt = now - self._dr_last_t
+        self._dr_last_t = now
+        if dt <= 0 or dt > 0.2 or not self._motors_active:
+            return
+
+        # Average forward duty → forward speed.
+        left = self._last_left_duty
+        right = self._last_right_duty
+        avg_fwd = (left + right) / 2.0
+        if abs(avg_fwd) < self._MIN_DUTY:
+            return
+        sign = 1.0 if avg_fwd > 0 else -1.0
+        speed = (abs(avg_fwd) - self._MIN_DUTY) * self._SPEED_PER_DUTY * sign
+        self._dr_x += speed * dt * math.cos(yaw)
+        self._dr_y += speed * dt * math.sin(yaw)
 
     async def _send_motor(self, left: int, right: int) -> None:
         if self._debug:
@@ -211,8 +263,8 @@ class ReactiveEngine:
 
     def _encode_map_image(self) -> str:
         """Render world map + JPEG-encode + base64 for the dashboard."""
-        bgr = self._world_map.render(size=320)
-        _, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        bgr = self._world_map.render(size=480)
+        _, buf = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 75])
         return base64.b64encode(buf).decode("ascii")
 
     async def _send_dashboard_status(
@@ -226,14 +278,15 @@ class ReactiveEngine:
         # Encode map every 5th frame to save bandwidth.
         map_b64 = self._encode_map_image() if self._frame_count % 5 == 0 else None
 
-        # Pose info from scan-match.
+        # Pose info: dead-reckoned position + gyro heading.
         pose = self._pose_source.latest()
-        pose_xy = pose.xy_m
         pose_data = {
-            "x": round(pose_xy[0], 3) if pose_xy else None,
-            "y": round(pose_xy[1], 3) if pose_xy else None,
+            "x": round(self._dr_x, 3),
+            "y": round(self._dr_y, 3),
             "yaw_deg": round(math.degrees(pose.yaw_rad), 1),
             "health": pose.health.value,
+            "imu_active": self._imu_active,
+            "gyro_yaw_deg": round(math.degrees(self._gyro.yaw_rad), 1) if self._imu_active else None,
         }
 
         try:
@@ -265,6 +318,7 @@ class ReactiveEngine:
             }
             if map_b64 is not None:
                 autonomy_data["map_image"] = map_b64
+                autonomy_data["map_ppm"] = round(self._world_map.last_ppm, 2)
 
             await self._client.send_vision_status(
                 state=state_str,
@@ -310,13 +364,32 @@ class ReactiveEngine:
                 self._proj_cfg,
             )
 
-            # Phase 2: scan-match odometry update.
-            self._pose_source.update(points)
+            # Phase 2: scan-match odometry — gyro is authoritative for
+            # rotation when IMU is live; pose frozen when motors are off.
+            gyro_yaw = self._gyro.yaw_rad if self._imu_active else None
+            self._pose_source.update(
+                points,
+                gyro_yaw=gyro_yaw,
+                motors_active=self._motors_active,
+            )
             pose = self._pose_source.latest()
-            px, py = pose.xy_m if pose.xy_m is not None else (0.0, 0.0)
-            # Only accumulate map points when pose is healthy.
+
+            # Dead-reckoning position: advances each frame using motor
+            # duty + gyro heading.  Scan-match blends in when healthy.
+            now_t = time.monotonic()
+            yaw = pose.yaw_rad
+            self._dead_reckon(now_t, yaw)
+
+            # When scan-match is healthy, nudge DR toward it so drift
+            # doesn't accumulate forever.
+            if pose.health == HealthState.HEALTHY and pose.xy_m is not None:
+                blend = 0.3
+                self._dr_x += blend * (pose.xy_m[0] - self._dr_x)
+                self._dr_y += blend * (pose.xy_m[1] - self._dr_y)
+
+            px, py = self._dr_x, self._dr_y
             good = pose.health == HealthState.HEALTHY and pose.xy_m is not None
-            self._world_map.add_frame(px, py, pose.yaw_rad, points, good_pose=good)
+            self._world_map.add_frame(px, py, yaw, points, good_pose=good)
 
             # Ultrasonic.
             us_m = self._get_ultrasonic_m()
@@ -326,6 +399,9 @@ class ReactiveEngine:
 
             # Motor command.
             decision = tick.decision
+            self._last_left_duty = decision.left_duty
+            self._last_right_duty = decision.right_duty
+            self._motors_active = decision.left_duty != 0 or decision.right_duty != 0
             await self._send_motor(decision.left_duty, decision.right_duty)
 
             # LED feedback.
@@ -336,8 +412,14 @@ class ReactiveEngine:
 
             # Periodic log.
             if self._frame_count % 30 == 0:
+                # Log the center-strip depth median alongside the ultrasonic
+                # reading so the user can calibrate --depth-scale.
+                h, w = depth_m.shape
+                center_strip = depth_m[h // 3 : 2 * h // 3, w // 3 : 2 * w // 3]
+                depth_median = float(np.median(center_strip))
+                imu_tag = "imu" if self._imu_active else "no-imu"
                 log.info(
-                    "[%d] depth=%.0fms react=%.1fms %s L=%+d R=%+d fwd=%.2fm us=%s pts=%d",
+                    "[%d] depth=%.0fms react=%.1fms %s L=%+d R=%+d fwd=%.2fm us=%s pts=%d dmed=%.2fm %s",
                     self._frame_count,
                     depth_ms,
                     tick.total_ms,
@@ -347,6 +429,8 @@ class ReactiveEngine:
                     tick.clearance_forward_m,
                     f"{us_m:.2f}m" if us_m is not None else "n/a",
                     tick.n_obstacle_points,
+                    depth_median,
+                    imu_tag,
                 )
 
     # ------------------------------------------------------------------
@@ -358,6 +442,7 @@ class ReactiveEngine:
 
         self._client.on_frame(self._on_frame)
         self._client.on_telemetry(self._on_telemetry)
+        self._client.on_imu(self._on_imu)
 
         await self._client.connect()
         if self._debug:
@@ -398,7 +483,7 @@ def main() -> None:
     parser.add_argument(
         "--depth-scale",
         type=float,
-        default=1.0,
+        default=0.56,
         help="Depth scale correction. Calibrate: face a hard flat wall, "
         "set depth_scale = ultrasonic_m / depth_model_median. "
         "Values < 1 mean the model over-estimates distance.",

@@ -17,8 +17,8 @@ from tankbot.shared.protocol import SERVO_DEFAULTS, clamp_servo
 
 log = logging.getLogger(__name__)
 
-# GPIO pins for each servo channel
-_PINS = {0: 7, 1: 8, 2: 25}
+# GPIO pins for each servo channel (v1 PCB layout)
+_PINS = {0: 7, 1: 8}
 
 # Sweep config
 _SWEEP_INTERVAL = 0.02  # 50 Hz — one step every 20ms
@@ -73,30 +73,16 @@ class _HardwarePWMBackend:
         }
         for pwm in self._pwms.values():
             pwm.start(0)
-        from gpiozero import AngularServo
-
-        self._servo2 = AngularServo(
-            25,
-            initial_angle=0,
-            min_angle=0,
-            max_angle=180,
-            min_pulse_width=0.5 / 1000,
-            max_pulse_width=2.5 / 1000,
-        )
 
     def set_angle(self, channel: int, angle: int) -> None:
         if channel in self._pwms:
             duty = 2.5 + (angle / 180) * 10.0
             self._pwms[channel].change_duty_cycle(duty)
-        elif channel == 2:
-            self._servo2.angle = angle
 
     def detach(self, channel: int) -> None:
         """Stop sending PWM so servo draws no current."""
         if channel in self._pwms:
             self._pwms[channel].change_duty_cycle(0)
-        elif channel == 2:
-            self._servo2.angle = None  # type: ignore[assignment]
 
     def stop(self) -> None:
         for pwm in self._pwms.values():
@@ -104,7 +90,6 @@ class _HardwarePWMBackend:
 
     def close(self) -> None:
         self.stop()
-        self._servo2.close()
 
 
 class ServoController:

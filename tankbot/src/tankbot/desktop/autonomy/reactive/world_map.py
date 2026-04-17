@@ -5,8 +5,8 @@ estimates. Used by both the live engine (for dashboard map image)
 and the replay harness (for offline visualization).
 
 The map is sparse (dict-backed) and unbounded — no fixed grid size.
-Rendering centers on the robot's latest pose and shows a configurable
-window around it.
+Rendering auto-zooms to the bounding box of all observed data, with
+padding, so the map is always readable regardless of scale.
 
 Quality gating: the caller signals whether the current pose is
 trustworthy. Only high-confidence frames contribute obstacle points
@@ -20,6 +20,12 @@ import math
 
 import cv2
 import numpy as np
+
+# Minimum visible world extent (meters) — avoids over-zooming when the
+# robot has barely moved.
+_MIN_EXTENT_M = 2.0
+# Padding added around the data bounding box (meters).
+_BBOX_PAD_M = 0.5
 
 
 class WorldMap:
@@ -44,10 +50,16 @@ class WorldMap:
         # Latest pose (always tracked, for centering).
         self._latest_pose: tuple[float, float, float] | None = None
         self._frame_idx: int = 0
+        self._last_ppm: float = 0.0
 
     @property
     def n_cells(self) -> int:
         return len(self._cells)
+
+    @property
+    def last_ppm(self) -> float:
+        """Pixels per meter from the most recent render() call."""
+        return self._last_ppm
 
     def add_frame(
         self,
@@ -97,58 +109,87 @@ class WorldMap:
             self._cells[key] = self._cells.get(key, 0) + 1
 
     def render(self, size: int | None = None) -> np.ndarray:
-        """Render the map as a BGR image, centered on the latest pose."""
+        """Render the map as a BGR image, auto-zoomed to fit the data."""
         sz = size or self._render_size
         img = np.full((sz, sz, 3), 30, dtype=np.uint8)
 
         if self._latest_pose is None:
             return img
 
-        cx, cy, yaw = self._latest_pose
+        robot_x, robot_y, yaw = self._latest_pose
 
-        # Draw occupied cells (only those with enough hits to be reliable).
+        # Compute data bounding box in world coordinates.
+        all_x = [robot_x]
+        all_y = [robot_y]
+        for tx, ty in self._trail:
+            all_x.append(tx)
+            all_y.append(ty)
+
+        strong_cells = None
+        strong_wx = None
+        strong_wy = None
         if self._cells:
             cells_arr = np.array(list(self._cells.keys()), dtype=np.float32)
             counts = np.array(list(self._cells.values()), dtype=np.float32)
-
-            # Filter by minimum hit count to suppress noise.
             strong = counts >= self._min_cell_hits
             if strong.any():
-                cells_arr = cells_arr[strong]
-                counts = counts[strong]
+                strong_cells = cells_arr[strong]
+                strong_wx = (strong_cells[:, 0] + 0.5) * self._res
+                strong_wy = (strong_cells[:, 1] + 0.5) * self._res
+                all_x.extend([float(strong_wx.min()), float(strong_wx.max())])
+                all_y.extend([float(strong_wy.min()), float(strong_wy.max())])
 
-                cell_wx = (cells_arr[:, 0] + 0.5) * self._res
-                cell_wy = (cells_arr[:, 1] + 0.5) * self._res
+        min_x, max_x = min(all_x), max(all_x)
+        min_y, max_y = min(all_y), max(all_y)
 
-                px_col = sz // 2 - ((cell_wy - cy) / self._res).astype(np.int32)
-                px_row = sz // 2 - ((cell_wx - cx) / self._res).astype(np.int32)
+        # Ensure a minimum visible extent so we don't over-zoom.
+        extent_x = max(max_x - min_x + 2 * _BBOX_PAD_M, _MIN_EXTENT_M)
+        extent_y = max(max_y - min_y + 2 * _BBOX_PAD_M, _MIN_EXTENT_M)
+        extent = max(extent_x, extent_y)
 
-                visible = (px_col >= 0) & (px_col < sz) & (px_row >= 0) & (px_row < sz)
-                px_col = px_col[visible]
-                px_row = px_row[visible]
-                vis_counts = counts[visible]
+        center_x = (min_x + max_x) * 0.5
+        center_y = (min_y + max_y) * 0.5
 
-                intensity = np.clip(np.log1p(vis_counts) * 30, 80, 255).astype(np.uint8)
-                for r, c, v in zip(px_row, px_col, intensity, strict=True):
-                    img[r, c] = (int(v), int(v), int(v))
+        # Pixels per meter — scale the data to fill the render image.
+        ppm = (sz - 4) / extent  # 2px margin on each side
+        self._last_ppm = ppm
+
+        def world_to_px(wx: float, wy: float) -> tuple[int, int]:
+            col = int(sz / 2 + (wy - center_y) * ppm)
+            row = int(sz / 2 - (wx - center_x) * ppm)
+            return col, row
+
+        # Draw occupied cells as visible filled squares.
+        cell_px = max(2, int(self._res * ppm * 0.8))
+        half_cell = cell_px // 2
+        if strong_wx is not None and strong_wy is not None:
+            counts_strong = counts[counts >= self._min_cell_hits]
+            intensity = np.clip(np.log1p(counts_strong) * 30, 80, 255).astype(np.uint8)
+            for i in range(len(strong_wx)):
+                c, r = world_to_px(float(strong_wx[i]), float(strong_wy[i]))
+                if 0 <= r < sz and 0 <= c < sz:
+                    v = int(intensity[i])
+                    r0 = max(0, r - half_cell)
+                    r1 = min(sz, r + half_cell + 1)
+                    c0 = max(0, c - half_cell)
+                    c1 = min(sz, c + half_cell + 1)
+                    img[r0:r1, c0:c1] = (v, v, v)
 
         # Pose trail (green line, subsampled).
         if len(self._trail) >= 2:
-            trail_px = []
-            for tx, ty in self._trail:
-                col = sz // 2 - int((ty - cy) / self._res)
-                row = sz // 2 - int((tx - cx) / self._res)
-                trail_px.append((col, row))
+            trail_px = [world_to_px(tx, ty) for tx, ty in self._trail]
+            line_w = max(1, int(ppm * 0.02))
             for i in range(1, len(trail_px)):
-                cv2.line(img, trail_px[i - 1], trail_px[i], (0, 160, 0), 1)
+                cv2.line(img, trail_px[i - 1], trail_px[i], (0, 160, 0), line_w, cv2.LINE_AA)
 
         # Current robot (bright green circle + heading arrow).
-        center = sz // 2
-        cv2.circle(img, (center, center), 4, (0, 255, 0), -1)
-        arrow_len = 15
-        ax = int(center - arrow_len * math.sin(yaw))
-        ay = int(center - arrow_len * math.cos(yaw))
-        cv2.arrowedLine(img, (center, center), (ax, ay), (0, 255, 0), 2)
+        rc, rr = world_to_px(robot_x, robot_y)
+        radius = max(4, int(ppm * 0.06))
+        cv2.circle(img, (rc, rr), radius, (0, 255, 0), -1)
+        arrow_len = max(12, int(ppm * 0.15))
+        ax = int(rc - arrow_len * math.sin(yaw))
+        ay = int(rr - arrow_len * math.cos(yaw))
+        cv2.arrowedLine(img, (rc, rr), (ax, ay), (0, 255, 0), max(2, int(ppm * 0.02)), tipLength=0.3)
 
         return img
 

@@ -63,6 +63,7 @@ defmodule TankbotWebWeb.DashboardLive do
        reactive_frame_count: 0,
        reactive_depth_image: nil,
        reactive_map_image: nil,
+       reactive_map_ppm: nil,
        reactive_pose_x: nil,
        reactive_pose_y: nil,
        reactive_pose_yaw: nil,
@@ -76,7 +77,8 @@ defmodule TankbotWebWeb.DashboardLive do
        imu_gx: 0.0,
        imu_gy: 0.0,
        imu_gz: 0.0,
-       imu_temp_c: nil
+       imu_temp_c: nil,
+       imu_last_render_ms: 0
      )}
   end
 
@@ -154,6 +156,7 @@ defmodule TankbotWebWeb.DashboardLive do
         reactive_frame_count: autonomy["frame_count"] || 0,
         reactive_depth_image: autonomy["depth_image"] || socket.assigns.reactive_depth_image,
         reactive_map_image: autonomy["map_image"] || socket.assigns.reactive_map_image,
+        reactive_map_ppm: autonomy["map_ppm"] || socket.assigns.reactive_map_ppm,
         reactive_pose_x: get_in(autonomy, ["pose", "x"]),
         reactive_pose_y: get_in(autonomy, ["pose", "y"]),
         reactive_pose_yaw: get_in(autonomy, ["pose", "yaw_deg"]),
@@ -187,6 +190,29 @@ defmodule TankbotWebWeb.DashboardLive do
       end
 
     {:noreply, socket}
+  end
+
+  def handle_info({:telemetry, %{"type" => "imu"} = data}, socket) do
+    # IMU streams at 50 Hz — only update the UI at ~5 Hz to avoid churn.
+    now = System.monotonic_time(:millisecond)
+    last = socket.assigns[:imu_last_render_ms] || 0
+
+    if now - last < 200 do
+      {:noreply, socket}
+    else
+      {:noreply,
+       assign(socket,
+         imu_available: true,
+         imu_ax: data["ax"] || 0.0,
+         imu_ay: data["ay"] || 0.0,
+         imu_az: data["az"] || 0.0,
+         imu_gx: data["gx"] || 0.0,
+         imu_gy: data["gy"] || 0.0,
+         imu_gz: data["gz"] || 0.0,
+         imu_temp_c: data["temp_c"],
+         imu_last_render_ms: now
+       )}
+    end
   end
 
   def handle_info({:telemetry, data}, socket) do
@@ -355,11 +381,21 @@ defmodule TankbotWebWeb.DashboardLive do
                 <img src={"data:image/jpeg;base64,#{@reactive_depth_image}"} class="w-full rounded" />
               </div>
             </div>
-            <%!-- Map below, full width --%>
+            <%!-- Map below, full width, zoomable --%>
             <%= if @reactive_map_image do %>
               <div class="mt-2">
-                <h2 class="text-sm font-semibold mb-1 text-gray-400">Map</h2>
-                <img src={"data:image/jpeg;base64,#{@reactive_map_image}"} class="w-full rounded max-h-64 mx-auto object-contain" />
+                <h2 class="text-sm font-semibold mb-1 text-gray-400 flex items-center gap-2">
+                  Map
+                  <span class="text-[10px] text-gray-500 font-normal">scroll to zoom, drag to pan</span>
+                </h2>
+                <div id="map-zoom" phx-hook="MapZoom"
+                     class="w-full rounded overflow-hidden bg-gray-900 cursor-grab active:cursor-grabbing relative"
+                     style="height: 400px;">
+                  <img id="map-zoom-img" src={"data:image/jpeg;base64,#{@reactive_map_image}"}
+                       class="absolute pointer-events-none select-none"
+                       style="transform-origin: 0 0;"
+                       draggable="false" />
+                </div>
               </div>
             <% end %>
           <% else %>

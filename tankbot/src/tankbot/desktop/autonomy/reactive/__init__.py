@@ -21,6 +21,7 @@ from tankbot.desktop.autonomy.reactive.extrinsics import (
     load_extrinsics,
 )
 from tankbot.desktop.autonomy.reactive.grid import ReactiveGrid, StopZoneQuery
+from tankbot.desktop.autonomy.reactive.gyro import GyroIntegrator, unwrap_delta
 from tankbot.desktop.autonomy.reactive.intrinsics import (
     CameraIntrinsics,
     load_intrinsics,
@@ -55,6 +56,7 @@ from tankbot.desktop.autonomy.reactive.scan_match_pose import (
 __all__ = [
     "CameraExtrinsics",
     "CameraIntrinsics",
+    "GyroIntegrator",
     "HealthState",
     "ICPConfig",
     "MatchResult",
@@ -77,4 +79,5 @@ __all__ = [
     "load_intrinsics",
     "match_scans",
     "project_depth_to_robot_points",
+    "unwrap_delta",
 ]

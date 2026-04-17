@@ -25,6 +25,7 @@ class RobotClient:
         self._ws: Any = None
         self._on_telemetry: Callable[[dict], Awaitable[None] | None] | None = None
         self._on_frame: Callable[[bytes], Awaitable[None] | None] | None = None
+        self._on_imu: Callable[[dict], Awaitable[None] | None] | None = None
         self._running = False
 
     def on_telemetry(self, callback: Callable[[dict], Awaitable[None] | None]) -> None:
@@ -32,6 +33,10 @@ class RobotClient:
 
     def on_frame(self, callback: Callable[[bytes], Awaitable[None] | None]) -> None:
         self._on_frame = callback
+
+    def on_imu(self, callback: Callable[[dict], Awaitable[None] | None]) -> None:
+        """Register a callback for high-rate IMU messages (50 Hz)."""
+        self._on_imu = callback
 
     async def connect(self) -> None:
         self._ws = await websockets.connect(self._url)
@@ -48,14 +53,21 @@ class RobotClient:
                     result = self._on_frame(msg)
                     if asyncio.iscoroutine(result):
                         await result
-                elif isinstance(msg, str) and self._on_telemetry:
+                elif isinstance(msg, str):
                     try:
                         data = json.loads(msg)
+                    except json.JSONDecodeError:
+                        continue
+                    # Route high-rate IMU messages separately so the generic
+                    # telemetry handler doesn't have to see ~50 of them per second.
+                    if data.get("type") == "imu" and self._on_imu:
+                        result = self._on_imu(data)
+                        if asyncio.iscoroutine(result):
+                            await result
+                    elif self._on_telemetry:
                         result = self._on_telemetry(data)
                         if asyncio.iscoroutine(result):
                             await result
-                    except json.JSONDecodeError:
-                        pass
         except websockets.ConnectionClosed:
             log.warning("Robot connection closed")
         finally:

@@ -90,6 +90,7 @@ class Robot:
     def _handle_mode_switch(self, mode: int) -> None:
         if mode == 0:
             self.car_mode = CarMode.MANUAL
+            self.left_speed, self.right_speed = 0, 0
             self.motor.stop()
         elif mode == 1:
             self.car_mode = CarMode.SONAR
@@ -124,6 +125,7 @@ class Robot:
         elif cmd_type == "mode":
             self._handle_mode_switch(int(msg.get("mode", 0)))
         elif cmd_type == "stop":
+            self.left_speed, self.right_speed = 0, 0
             self.motor.stop()
         elif cmd_type == "vision":
             # Store and re-broadcast vision engine status to all clients
@@ -190,7 +192,16 @@ class Robot:
             self.camera.stop_stream()
 
     async def _imu_loop(self) -> None:
-        """Poll the IMU at 50 Hz so telemetry always has a fresh reading."""
+        """Poll the IMU at 50 Hz.
+
+        Stores latest reading for the 1 Hz dashboard snapshot, and broadcasts
+        a dedicated high-rate `{"type": "imu", ...}` message to WS clients
+        (the autonomy engine uses this to integrate yaw for the scan-match
+        rotation prior).
+
+        When the motors are idle and the measured gyro is small, blend the
+        reading into the bias to track thermal drift.
+        """
         if not self.imu.available:
             return
         loop = asyncio.get_running_loop()
@@ -198,6 +209,25 @@ class Robot:
             reading = await loop.run_in_executor(None, self.imu.read)
             if reading is not None:
                 self._latest_imu = reading.as_dict()
+
+                # Adaptive bias update when clearly stationary.
+                if (
+                    self.left_speed == 0
+                    and self.right_speed == 0
+                    and abs(reading.gx) < 2.0
+                    and abs(reading.gy) < 2.0
+                    and abs(reading.gz) < 2.0
+                ):
+                    self.imu.mark_stationary(reading)
+
+                if self.ws_api.has_clients:
+                    await self.ws_api.broadcast_telemetry(
+                        {
+                            "type": "imu",
+                            "t": asyncio.get_running_loop().time(),
+                            **self._latest_imu,
+                        }
+                    )
             await asyncio.sleep(0.02)
 
     async def _telemetry_loop(self) -> None:
