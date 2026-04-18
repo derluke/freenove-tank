@@ -142,6 +142,16 @@ tasks:
         -e vendor/MASt3R-SLAM/thirdparty/mast3r/dust3r/croco/models/curope
 
   vision:start:
+    desc: Start the reactive autonomy engine (depth-based wander, no SLAM)
+    cmds:
+      - uv run tankbot-reactive --robot ws://{{.PI_HOST}}:9000
+
+  vision:debug:
+    desc: Reactive autonomy engine in debug mode (no motor commands)
+    cmds:
+      - uv run tankbot-reactive --robot ws://{{.PI_HOST}}:9000 --debug
+
+  vision:mast3r:start:
     desc: Start vanilla live MASt3R-SLAM on the robot camera and export to the web viewer
     cmds:
       - >-
@@ -154,11 +164,11 @@ tasks:
         --config vendor/MASt3R-SLAM/config/base.yaml
         --no-viz
 
-  vision:start:calib:
+  vision:mast3r:start:calib:
     desc: Start vanilla live MASt3R-SLAM with camera calibration and export to the web viewer
     preconditions:
       - sh: test -n "{{.CAMERA_CALIB}}"
-        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:start:calib CAMERA_CALIB=vendor/MASt3R-SLAM/config/intrinsics.yaml`
+        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:mast3r:start:calib CAMERA_CALIB=vendor/MASt3R-SLAM/config/intrinsics.yaml`
     cmds:
       - >-
         UV_CACHE_DIR=/tmp/uv-cache
@@ -184,16 +194,16 @@ tasks:
     cmds:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --calib {{.CAMERA_CALIB}}
 
-  vision:debug:
-    desc: Vision debug mode — SLAM tracking, no motor commands
+  vision:legacy:debug:
+    desc: Legacy vision engine debug mode — SLAM tracking, no motor commands
     cmds:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug
 
-  vision:debug:calib:
-    desc: Vision debug mode with camera calibration enabled
+  vision:legacy:debug:calib:
+    desc: Legacy vision debug mode with camera calibration enabled
     preconditions:
       - sh: test -n "{{.CAMERA_CALIB}}"
-        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:debug:calib CAMERA_CALIB=vendor/MASt3R-SLAM/config/intrinsics.yaml`
+        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:legacy:debug:calib CAMERA_CALIB=vendor/MASt3R-SLAM/config/intrinsics.yaml`
     cmds:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug --calib {{.CAMERA_CALIB}}
 

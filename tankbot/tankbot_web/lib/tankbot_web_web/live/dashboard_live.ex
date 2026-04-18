@@ -390,11 +390,19 @@ defmodule TankbotWebWeb.DashboardLive do
                 </h2>
                 <div id="map-zoom" phx-hook="MapZoom"
                      class="w-full rounded overflow-hidden bg-gray-900 cursor-grab active:cursor-grabbing relative"
-                     style="height: 400px;">
+                     style="height: 400px;"
+                     data-ppm={@reactive_map_ppm}>
                   <img id="map-zoom-img" src={"data:image/jpeg;base64,#{@reactive_map_image}"}
                        class="absolute pointer-events-none select-none"
                        style="transform-origin: 0 0;"
                        draggable="false" />
+                  <div id="map-scale-bar" class="absolute bottom-3 left-3 pointer-events-none" style="z-index: 10;">
+                    <div class="text-gray-300 text-xs mb-0.5" id="map-scale-label"></div>
+                    <div class="bg-gray-300 relative" style="height: 2px;" id="map-scale-line">
+                      <div class="absolute left-0 top-[-3px] w-px h-[8px] bg-gray-300"></div>
+                      <div class="absolute right-0 top-[-3px] w-px h-[8px] bg-gray-300"></div>
+                    </div>
+                  </div>
                 </div>
               </div>
             <% end %>

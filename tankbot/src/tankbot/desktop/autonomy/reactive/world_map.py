@@ -155,7 +155,9 @@ class WorldMap:
         self._last_ppm = ppm
 
         def world_to_px(wx: float, wy: float) -> tuple[int, int]:
-            col = int(sz / 2 + (wy - center_y) * ppm)
+            # Top-down view: +x_world (forward at yaw=0) → screen up,
+            # +y_world (left at yaw=0) → screen left.
+            col = int(sz / 2 - (wy - center_y) * ppm)
             row = int(sz / 2 - (wx - center_x) * ppm)
             return col, row
 

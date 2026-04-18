@@ -24,11 +24,11 @@ class LedStrip:
             return
 
         if pcb_version == 1:
-            from .rpi_ledpixel import Freenove_RPI_WS281X  # type: ignore[import-untyped]
+            from .rpi_ledpixel import Freenove_RPI_WS281X
 
             self._strip = Freenove_RPI_WS281X(LED_COUNT, 255, "RGB")
         else:
-            from .spi_ledpixel import Freenove_SPI_LedPixel  # type: ignore[import-untyped]
+            from .spi_ledpixel import Freenove_SPI_LedPixel
 
             self._strip = Freenove_SPI_LedPixel(LED_COUNT, 255, "GRB")
 

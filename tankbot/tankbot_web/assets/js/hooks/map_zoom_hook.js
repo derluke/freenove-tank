@@ -1,12 +1,37 @@
 /**
- * MapZoom hook — adds mouse-wheel zoom and click-drag pan to the
- * server-rendered occupancy map image.
+ * MapZoom hook — mouse-wheel zoom, click-drag pan, and a live scale
+ * bar overlay that stays fixed on screen regardless of zoom level.
  *
- * The image source is updated by LiveView via the normal DOM patch.
- * We override the img's CSS transform to apply zoom + translate,
- * keeping it responsive to new image payloads without losing the
- * user's current viewport.
+ * The server sends `data-ppm` (pixels-per-meter at 1x zoom) on the
+ * container. The scale bar picks a round distance whose bar length is
+ * ~25% of the container width at the current zoom, so the user can
+ * always visually compare distances on the map.
  */
+
+const NICE_DISTANCES = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0];
+
+function pickScaleBar(ppmScreen, containerWidth) {
+  // Target: bar should be ~25% of the container width in pixels.
+  const targetPx = containerWidth * 0.25;
+  const targetM = targetPx / ppmScreen;
+  let best = NICE_DISTANCES[0];
+  let bestDiff = Math.abs(best - targetM);
+  for (const d of NICE_DISTANCES) {
+    const diff = Math.abs(d - targetM);
+    if (diff < bestDiff) {
+      best = d;
+      bestDiff = diff;
+    }
+  }
+  return { meters: best, pixels: Math.round(best * ppmScreen) };
+}
+
+function formatDistance(m) {
+  if (m < 0.1) return `${Math.round(m * 100)}cm`;
+  if (m < 1.0) return `${m.toFixed(1)}m`;
+  return `${m.toFixed(0)}m`;
+}
+
 export const MapZoom = {
   mounted() {
     this.scale = 1.0;
@@ -23,10 +48,8 @@ export const MapZoom = {
     if (!img) return;
     this.img = img;
 
-    // Fit image to container initially.
     this._fitImage();
 
-    // Zoom on scroll.
     container.addEventListener("wheel", (e) => {
       e.preventDefault();
       const rect = container.getBoundingClientRect();
@@ -35,15 +58,13 @@ export const MapZoom = {
 
       const oldScale = this.scale;
       const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-      this.scale = Math.max(0.5, Math.min(10, this.scale * factor));
+      this.scale = Math.max(0.5, Math.min(20, this.scale * factor));
 
-      // Zoom toward the mouse position.
       this.tx = mx - (mx - this.tx) * (this.scale / oldScale);
       this.ty = my - (my - this.ty) * (this.scale / oldScale);
       this._apply();
     }, { passive: false });
 
-    // Pan on drag.
     container.addEventListener("mousedown", (e) => {
       this.dragging = true;
       this.dragStartX = e.clientX;
@@ -63,7 +84,6 @@ export const MapZoom = {
       this.dragging = false;
     });
 
-    // Double-click to reset.
     container.addEventListener("dblclick", () => {
       this.scale = 1.0;
       this.tx = 0;
@@ -73,7 +93,6 @@ export const MapZoom = {
   },
 
   updated() {
-    // LiveView patched the DOM — the img src changed. Re-apply transform.
     const img = this.el.querySelector("img");
     if (img) {
       this.img = img;
@@ -87,11 +106,9 @@ export const MapZoom = {
   },
 
   _fitImage() {
-    // Center the image in the container at 1:1 scale.
     const container = this.el;
     const cw = container.clientWidth;
     const ch = container.clientHeight;
-    // Image is square (480x480), fit it to the container.
     const imgSize = Math.min(cw, ch);
     this.scale = imgSize / 480;
     this.tx = (cw - 480 * this.scale) / 2;
@@ -104,5 +121,21 @@ export const MapZoom = {
     this.img.style.width = "480px";
     this.img.style.height = "480px";
     this.img.style.transform = `translate(${this.tx}px, ${this.ty}px) scale(${this.scale})`;
+    this._updateScaleBar();
+  },
+
+  _updateScaleBar() {
+    const basePpm = parseFloat(this.el.dataset.ppm);
+    if (!basePpm || basePpm <= 0) return;
+
+    // Effective pixels-per-meter on screen = base ppm * current zoom scale.
+    const ppmScreen = basePpm * this.scale;
+    const cw = this.el.clientWidth;
+    const bar = pickScaleBar(ppmScreen, cw);
+
+    const label = this.el.querySelector("#map-scale-label");
+    const line = this.el.querySelector("#map-scale-line");
+    if (label) label.textContent = formatDistance(bar.meters);
+    if (line) line.style.width = `${bar.pixels}px`;
   },
 };
