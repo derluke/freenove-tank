@@ -11,18 +11,22 @@ depth-model reload, no re-projection.
 Usage:
     tankbot-replay-frontier --dataset recordings/phase0c/straight_2m
     tankbot-replay-frontier --dataset <path> --render-dir logs/frontier_replay
+    tankbot-replay-frontier --dataset-root recordings/phase0c --max-frames 120
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
+from tankbot.desktop.autonomy.dataset import is_stream_dataset
 from tankbot.desktop.autonomy.frontier import PlannerMode, PlannerSnapshot
 from tankbot.desktop.autonomy.reactive.pose import HealthState, PoseEstimate
 from tankbot.desktop.autonomy.reactive.scan import ScanConfig
@@ -40,6 +44,7 @@ from tankbot.desktop.autonomy.scanmatch_eval import (
     _DEFAULT_DEPTH_SCALE,
     _DEFAULT_EXTRINSICS,
     _DEFAULT_INTRINSICS,
+    GroundTruth,
     Observations,
     build_observations,
 )
@@ -74,6 +79,50 @@ class ReplaySummary:
     degraded_continue_ticks: int
     degraded_hold_ticks: int
     final_snapshot: PlannerSnapshot
+
+
+@dataclass(frozen=True)
+class SweepRow:
+    dataset: str
+    n_frames: int
+    final_health: str
+    final_planner: str
+    final_reason: str
+    frac_healthy: float
+    frac_degraded: float
+    frac_broken: float
+    frac_hold: float
+    frac_turn: float
+    frac_forward: float
+    frac_frontier: float
+    degraded_continue_ticks: int
+    degraded_hold_ticks: int
+    recenters: int
+    frontier_clusters: int
+    endpoint_error_m: float | None
+    heading_error_deg: float | None
+
+    def as_row(self) -> dict[str, Any]:
+        return {
+            "dataset": self.dataset,
+            "n_frames": self.n_frames,
+            "final_health": self.final_health,
+            "final_planner": self.final_planner,
+            "final_reason": self.final_reason,
+            "frac_healthy": self.frac_healthy,
+            "frac_degraded": self.frac_degraded,
+            "frac_broken": self.frac_broken,
+            "frac_hold": self.frac_hold,
+            "frac_turn": self.frac_turn,
+            "frac_forward": self.frac_forward,
+            "frac_frontier": self.frac_frontier,
+            "degraded_continue_ticks": self.degraded_continue_ticks,
+            "degraded_hold_ticks": self.degraded_hold_ticks,
+            "recenters": self.recenters,
+            "frontier_clusters": self.frontier_clusters,
+            "endpoint_error_m": self.endpoint_error_m,
+            "heading_error_deg": self.heading_error_deg,
+        }
 
 
 def _colorize_state(state: np.ndarray) -> np.ndarray:
@@ -323,9 +372,129 @@ def _print_summary(s: ReplaySummary) -> None:
         print("  health transitions: none")
 
 
+def _discover_datasets(dataset_root: Path) -> list[Path]:
+    if not dataset_root.exists():
+        msg = f"Dataset root not found: {dataset_root}"
+        raise FileNotFoundError(msg)
+    return sorted(
+        p for p in dataset_root.iterdir()
+        if p.is_dir() and is_stream_dataset(p)
+    )
+
+
+def _compute_optional_ground_truth_metrics(dataset: Path, summary: ReplaySummary) -> tuple[float | None, float | None]:
+    gt_path = dataset / "ground_truth.json"
+    if not gt_path.exists():
+        return None, None
+    gt = GroundTruth.from_json(gt_path)
+    xy = summary.final_pose.xy_m if summary.final_pose.xy_m is not None else None
+    if xy is None:
+        return None, None
+    endpoint_error = math.hypot(xy[0] - gt.end_xy_m[0], xy[1] - gt.end_xy_m[1])
+    heading_error = math.degrees(summary.final_pose.yaw_rad) - gt.end_yaw_deg
+    return endpoint_error, heading_error
+
+
+def _row_for_summary(dataset: Path, summary: ReplaySummary) -> SweepRow:
+    total = max(summary.n_frames, 1)
+    endpoint_error, heading_error = _compute_optional_ground_truth_metrics(dataset, summary)
+    return SweepRow(
+        dataset=dataset.name,
+        n_frames=summary.n_frames,
+        final_health=summary.final_pose.health.value,
+        final_planner=summary.final_command_mode.value,
+        final_reason=summary.final_command_reason,
+        frac_healthy=summary.health_counts[HealthState.HEALTHY] / total,
+        frac_degraded=summary.health_counts[HealthState.DEGRADED] / total,
+        frac_broken=summary.health_counts[HealthState.BROKEN] / total,
+        frac_hold=summary.command_counts[PlannerMode.HOLD] / total,
+        frac_turn=summary.command_counts[PlannerMode.TURN] / total,
+        frac_forward=summary.command_counts[PlannerMode.FORWARD] / total,
+        frac_frontier=summary.command_counts[PlannerMode.APPROACH_FRONTIER] / total,
+        degraded_continue_ticks=summary.degraded_continue_ticks,
+        degraded_hold_ticks=summary.degraded_hold_ticks,
+        recenters=summary.recenters,
+        frontier_clusters=summary.final_frontier_clusters,
+        endpoint_error_m=endpoint_error,
+        heading_error_deg=heading_error,
+    )
+
+
+def sweep_datasets(
+    datasets: list[Path],
+    *,
+    backend: str,
+    depth_scale: float,
+    intrinsics_path: Path,
+    extrinsics_path: Path,
+    max_frames: int | None,
+    rebuild_cache: bool,
+    grid_config: RollingGridConfig,
+    render_root: Path | None = None,
+    render_every: int = 10,
+    upscale: int = 5,
+) -> list[SweepRow]:
+    rows: list[SweepRow] = []
+    for dataset in datasets:
+        render_dir = None if render_root is None else (render_root / dataset.name)
+        obs = build_observations(
+            dataset,
+            backend=backend,
+            depth_scale=depth_scale,
+            intrinsics_path=intrinsics_path,
+            extrinsics_path=extrinsics_path,
+            max_frames=max_frames,
+            force=rebuild_cache,
+            verbose=True,
+        )
+        summary = replay(
+            obs,
+            grid_config=grid_config,
+            render_dir=render_dir,
+            render_every=render_every,
+            upscale=upscale,
+        )
+        rows.append(_row_for_summary(dataset, summary))
+    return rows
+
+
+def _print_sweep(rows: list[SweepRow]) -> None:
+    print()
+    print("=== Rolling frontier sweep summary ===")
+    if not rows:
+        print("  no datasets")
+        return
+    header = (
+        f"{'dataset':<22} {'frm':>5} {'hlt':>5} {'deg':>5} {'brk':>5} "
+        f"{'hold':>5} {'turn':>5} {'frt':>5} {'d+':>4} {'dH':>4} "
+        f"{'rec':>3} {'fc':>3} {'endpt':>6} {'yaw':>6}  {'final':<17} {'reason'}"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        endpoint = f"{row.endpoint_error_m:>6.3f}" if row.endpoint_error_m is not None else "   n/a"
+        yaw = f"{row.heading_error_deg:>+6.1f}" if row.heading_error_deg is not None else "   n/a"
+        print(
+            f"{row.dataset:<22} {row.n_frames:>5d} {row.frac_healthy:>5.0%} {row.frac_degraded:>5.0%} {row.frac_broken:>5.0%} "
+            f"{row.frac_hold:>5.0%} {row.frac_turn:>5.0%} {row.frac_frontier:>5.0%} "
+            f"{row.degraded_continue_ticks:>4d} {row.degraded_hold_ticks:>4d} "
+            f"{row.recenters:>3d} {row.frontier_clusters:>3d} {endpoint} {yaw}  "
+            f"{row.final_planner:<17} {row.final_reason}"
+        )
+
+
+def _save_sweep_json(path: Path, rows: list[SweepRow]) -> None:
+    path.write_text(
+        json.dumps([row.as_row() for row in rows], indent=2),
+        encoding="utf-8",
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Replay a dataset into the rolling frontier grid.")
-    parser.add_argument("--dataset", type=Path, required=True)
+    dataset_group = parser.add_mutually_exclusive_group(required=True)
+    dataset_group.add_argument("--dataset", type=Path)
+    dataset_group.add_argument("--dataset-root", type=Path, help="Sweep all dataset dirs beneath this root.")
     parser.add_argument("--backend", default=_DEFAULT_DEPTH_BACKEND)
     parser.add_argument("--extrinsics", type=Path, default=Path(_DEFAULT_EXTRINSICS))
     parser.add_argument("--intrinsics", type=Path, default=Path(_DEFAULT_INTRINSICS))
@@ -341,8 +510,38 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--render-dir", type=Path, default=None, help="If set, write PNG panels here.")
     parser.add_argument("--render-every", type=int, default=10, help="Render every Nth frame.")
     parser.add_argument("--upscale", type=int, default=5, help="Nearest-neighbor upscale factor for panels.")
+    parser.add_argument("--save-json", type=Path, default=None, help="If set, write sweep rows to JSON.")
     args = parser.parse_args(argv)
 
+    grid_cfg = RollingGridConfig(
+        window_size_m=args.window_size_m,
+        resolution_m=args.resolution_m,
+        recenter_margin_m=args.recenter_margin_m,
+        max_observation_range_m=args.max_obs_range_m,
+    )
+
+    if args.dataset_root is not None:
+        datasets = _discover_datasets(args.dataset_root)
+        rows = sweep_datasets(
+            datasets,
+            backend=args.backend,
+            depth_scale=args.depth_scale,
+            intrinsics_path=args.intrinsics,
+            extrinsics_path=args.extrinsics,
+            max_frames=args.max_frames,
+            rebuild_cache=args.rebuild_cache,
+            grid_config=grid_cfg,
+            render_root=args.render_dir,
+            render_every=args.render_every,
+            upscale=args.upscale,
+        )
+        _print_sweep(rows)
+        if args.save_json is not None:
+            _save_sweep_json(args.save_json, rows)
+            print(f"\nFull results written to {args.save_json}")
+        return
+
+    assert args.dataset is not None
     if not args.dataset.exists():
         print(f"Dataset not found: {args.dataset}", file=sys.stderr)
         sys.exit(1)
@@ -356,14 +555,6 @@ def main(argv: list[str] | None = None) -> None:
         max_frames=args.max_frames,
         force=args.rebuild_cache,
     )
-
-    grid_cfg = RollingGridConfig(
-        window_size_m=args.window_size_m,
-        resolution_m=args.resolution_m,
-        recenter_margin_m=args.recenter_margin_m,
-        max_observation_range_m=args.max_obs_range_m,
-    )
-
     summary = replay(
         obs,
         grid_config=grid_cfg,

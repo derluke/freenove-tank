@@ -111,6 +111,21 @@ def _load_observations(path: Path) -> Observations:
     )
 
 
+def _slice_observations(obs: Observations, max_frames: int | None) -> Observations:
+    if max_frames is None or max_frames >= obs.n_frames:
+        return obs
+    n = max(0, int(max_frames))
+    end_offset = int(obs.points_offsets[n])
+    return Observations(
+        t_monotonic=obs.t_monotonic[:n].copy(),
+        frame_idx=obs.frame_idx[:n].copy(),
+        gyro_yaw=obs.gyro_yaw[:n].copy(),
+        motors_active=obs.motors_active[:n].copy(),
+        points_offsets=obs.points_offsets[: n + 1].copy(),
+        points_xyz=obs.points_xyz[:end_offset].copy(),
+    )
+
+
 def build_observations(
     dataset: Path,
     *,
@@ -125,10 +140,10 @@ def build_observations(
     """Build (or reload) the per-frame observations cache for ``dataset``."""
     proj_cfg = ProjectionConfig(depth_scale=depth_scale)
     cache = _cache_path(dataset, backend, proj_cfg)
-    if cache.exists() and not force and max_frames is None:
+    if cache.exists() and not force:
         if verbose:
             print(f"Loading cached observations: {cache.name}")
-        return _load_observations(cache)
+        return _slice_observations(_load_observations(cache), max_frames)
 
     import cv2
 

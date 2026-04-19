@@ -296,6 +296,20 @@ tasks:
         {{if .MAX_FRAMES}}--max-frames {{.MAX_FRAMES}}{{end}}
         {{if .REBUILD}}--rebuild-cache{{end}}
 
+  frontier:sweep:
+    desc: Replay the rolling frontier planner across a dataset root and print a compact summary table
+    preconditions:
+      - sh: test -n "{{.DATASET_ROOT}}"
+        msg: Set DATASET_ROOT to a recordings dir, e.g. `task frontier:sweep DATASET_ROOT=recordings/phase0c`
+    cmds:
+      - >-
+        uv run --extra desktop tankbot-replay-frontier
+        --dataset-root {{.DATASET_ROOT}}
+        {{if .RENDER_DIR}}--render-dir {{.RENDER_DIR}}{{end}}
+        {{if .MAX_FRAMES}}--max-frames {{.MAX_FRAMES}}{{end}}
+        {{if .SAVE_JSON}}--save-json {{.SAVE_JSON}}{{end}}
+        {{if .REBUILD}}--rebuild-cache{{end}}
+
   projection:inspect:
     desc: Render per-pixel depth→robot-frame→scan-band diagnostic for a single frame
     preconditions:
