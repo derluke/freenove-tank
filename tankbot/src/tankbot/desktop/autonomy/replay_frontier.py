@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 
+from tankbot.desktop.autonomy.frontier import PlannerMode, PlannerSnapshot
 from tankbot.desktop.autonomy.reactive.pose import HealthState, PoseEstimate
 from tankbot.desktop.autonomy.reactive.scan import ScanConfig
 from tankbot.desktop.autonomy.reactive.scan_match import ICPConfig
@@ -31,7 +32,7 @@ from tankbot.desktop.autonomy.reactive.scan_match_pose import (
     ScanMatchPoseSource,
 )
 from tankbot.desktop.autonomy.rolling_frontier import (
-    RollingFrontierGrid,
+    RollingFrontierPlanner,
     RollingGridConfig,
 )
 from tankbot.desktop.autonomy.scanmatch_eval import (
@@ -58,6 +59,10 @@ class ReplaySummary:
     health_counts: dict[HealthState, int]
     transitions: list[HealthTransition]
     final_pose: PoseEstimate
+    final_command_mode: PlannerMode
+    final_command_reason: str
+    final_command_target_cell: tuple[int, int] | None
+    final_selected_frontier_cell: tuple[int, int] | None
     final_anchor_xy: tuple[float, float]
     final_free_cells: int
     final_occupied_cells: int
@@ -65,6 +70,10 @@ class ReplaySummary:
     final_frontier_clusters: int
     total_writes: int
     recenters: int
+    command_counts: dict[PlannerMode, int]
+    degraded_continue_ticks: int
+    degraded_hold_ticks: int
+    final_snapshot: PlannerSnapshot
 
 
 def _colorize_state(state: np.ndarray) -> np.ndarray:
@@ -76,14 +85,14 @@ def _colorize_state(state: np.ndarray) -> np.ndarray:
     return img
 
 
-def _draw_frontier(img: np.ndarray, grid: RollingFrontierGrid) -> None:
-    for cluster in grid.frontier_clusters():
+def _draw_frontier(img: np.ndarray, planner: RollingFrontierPlanner) -> None:
+    for cluster in planner.grid.frontier_clusters():
         for row, col in cluster:
             img[row, col] = (0, 0, 220)
 
 
 def _render(
-    grid: RollingFrontierGrid,
+    planner: RollingFrontierPlanner,
     pose: PoseEstimate,
     upscale: int = 5,
 ) -> np.ndarray:
@@ -95,9 +104,10 @@ def _render(
     """
     import cv2
 
+    grid = planner.grid
     state = grid.state_grid()
     img = _colorize_state(state)
-    _draw_frontier(img, grid)
+    _draw_frontier(img, planner)
 
     h, w = img.shape[:2]
     big = cv2.resize(img, (w * upscale, h * upscale), interpolation=cv2.INTER_NEAREST)
@@ -124,6 +134,7 @@ def _render(
     lines = [
         f"anchor=({anchor[0]:+.2f}, {anchor[1]:+.2f}) m",
         f"health={pose.health.value}",
+        f"planner={planner.snapshot().planner_mode}",
         f"pose=({pose.xy_m[0]:+.3f}, {pose.xy_m[1]:+.3f}) m" if pose.xy_m else "pose=None",
         f"yaw={math.degrees(pose.yaw_rad):+.1f} deg",
     ]
@@ -153,7 +164,7 @@ def replay(
         icp_config=icp_config or ICPConfig(),
         config=sm_config or ScanMatchConfig(),
     )
-    grid = RollingFrontierGrid(grid_config)
+    planner = RollingFrontierPlanner(grid_config)
 
     if render_dir is not None:
         render_dir.mkdir(parents=True, exist_ok=True)
@@ -164,9 +175,13 @@ def replay(
         HealthState.BROKEN: 0,
     }
     transitions: list[HealthTransition] = []
+    command_counts: dict[PlannerMode, int] = {mode: 0 for mode in PlannerMode}
+    degraded_continue_ticks = 0
+    degraded_hold_ticks = 0
     prev_health: HealthState | None = None
     prev_anchor: tuple[float, float] | None = None
     recenters = 0
+    final_command = None
 
     for i in range(obs.n_frames):
         points = obs.frame_points(i)
@@ -180,7 +195,15 @@ def replay(
         )
         pose = pose_source.latest()
 
-        grid.update_from_frame(pose, points)
+        planner.update_from_frame(pose, points)
+        command = planner.command_for_pose(pose)
+        final_command = command
+        command_counts[command.mode] = command_counts.get(command.mode, 0) + 1
+        if pose.health == HealthState.DEGRADED:
+            if command.reason == "pose_degraded_continue":
+                degraded_continue_ticks += 1
+            elif command.mode == PlannerMode.HOLD:
+                degraded_hold_ticks += 1
 
         health_counts[pose.health] = health_counts.get(pose.health, 0) + 1
         if prev_health is None or pose.health != prev_health:
@@ -192,10 +215,10 @@ def replay(
                         prev=prev_health,
                         curr=pose.health,
                     )
-                )
+            )
             prev_health = pose.health
 
-        anchor = grid.anchor_xy_m
+        anchor = planner.grid.anchor_xy_m
         if prev_anchor is not None and anchor != prev_anchor:
             recenters += 1
         prev_anchor = anchor
@@ -203,29 +226,40 @@ def replay(
         if render_dir is not None and i % render_every == 0:
             import cv2
 
-            panel = _render(grid, pose, upscale=upscale)
+            panel = _render(planner, pose, upscale=upscale)
             cv2.imwrite(str(render_dir / f"frontier_{i:06d}.png"), panel)
 
         if progress_every and (i + 1) % progress_every == 0:
             print(
                 f"  frame {i + 1}/{obs.n_frames}  health={pose.health.value:<8}  "
+                f"planner={command.mode.value:<17}  "
                 f"anchor=({anchor[0]:+.2f},{anchor[1]:+.2f})  recenters={recenters}",
             )
 
-    snap = grid.snapshot()
+    snap = planner.grid.snapshot()
+    planner_snapshot = planner.snapshot()
     final_pose = pose_source.latest()
+    assert final_command is not None
     return ReplaySummary(
         n_frames=obs.n_frames,
         health_counts=health_counts,
         transitions=transitions,
         final_pose=final_pose,
+        final_command_mode=final_command.mode,
+        final_command_reason=final_command.reason,
+        final_command_target_cell=final_command.target_cell,
+        final_selected_frontier_cell=planner.selected_frontier_cell,
         final_anchor_xy=snap.anchor_xy_m,
         final_free_cells=snap.free_cells,
         final_occupied_cells=snap.occupied_cells,
         final_unknown_cells=snap.unknown_cells,
-        final_frontier_clusters=len(grid.frontier_clusters()),
+        final_frontier_clusters=len(planner.grid.frontier_clusters()),
         total_writes=snap.writes_since_reset,
         recenters=recenters,
+        command_counts=command_counts,
+        degraded_continue_ticks=degraded_continue_ticks,
+        degraded_hold_ticks=degraded_hold_ticks,
+        final_snapshot=planner_snapshot,
     )
 
 
@@ -235,12 +269,27 @@ def _print_summary(s: ReplaySummary) -> None:
     print("=== Rolling frontier replay summary ===")
     print(f"  frames:            {s.n_frames}")
     print(f"  final health:      {s.final_pose.health.value}")
+    print(f"  final planner:     {s.final_command_mode.value} ({s.final_command_reason})")
     print(
         "  health mix:        "
         f"healthy={s.health_counts[HealthState.HEALTHY] / total:.0%}  "
         f"degraded={s.health_counts[HealthState.DEGRADED] / total:.0%}  "
         f"broken={s.health_counts[HealthState.BROKEN] / total:.0%}",
     )
+    print(
+        "  planner mix:       "
+        f"hold={s.command_counts[PlannerMode.HOLD] / total:.0%}  "
+        f"turn={s.command_counts[PlannerMode.TURN] / total:.0%}  "
+        f"forward={s.command_counts[PlannerMode.FORWARD] / total:.0%}  "
+        f"frontier={s.command_counts[PlannerMode.APPROACH_FRONTIER] / total:.0%}",
+    )
+    if s.health_counts[HealthState.DEGRADED] > 0:
+        degraded_total = s.health_counts[HealthState.DEGRADED]
+        print(
+            "  degraded policy:   "
+            f"continue={s.degraded_continue_ticks}/{degraded_total}  "
+            f"hold={s.degraded_hold_ticks}/{degraded_total}",
+        )
     if s.final_pose.xy_m is not None:
         fx, fy = s.final_pose.xy_m
         print(f"  final pose:        ({fx:+.3f}, {fy:+.3f}) m  yaw={math.degrees(s.final_pose.yaw_rad):+.2f} deg")
@@ -255,6 +304,15 @@ def _print_summary(s: ReplaySummary) -> None:
         f"free={s.final_free_cells}  occ={s.final_occupied_cells}  unknown={s.final_unknown_cells}",
     )
     print(f"  frontier clusters: {s.final_frontier_clusters}")
+    if s.final_snapshot.selected_frontier is not None:
+        tx, ty = s.final_snapshot.selected_frontier
+        print(
+            "  selected frontier: "
+            f"({tx:+.2f}, {ty:+.2f}) m  cell={s.final_selected_frontier_cell}"
+        )
+        print(f"  command target:    {s.final_command_target_cell}")
+    else:
+        print("  selected frontier: none")
 
     if s.transitions:
         print()

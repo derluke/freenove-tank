@@ -31,6 +31,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
+from typing import Deque
 
 import numpy as np
 
@@ -51,6 +52,20 @@ _DEFAULT_MAX_OBS_RANGE_M = 4.0
 _DEFAULT_WINDOW_SIZE_M = 12.0
 _DEFAULT_RESOLUTION_M = 0.10
 _DEFAULT_RECENTER_MARGIN_M = 3.0
+_TURN_IN_PLACE_RAD = math.radians(38.0)
+_FORWARD_HEADING_RAD = math.radians(55.0)
+_FRONTIER_REACHED_M = 0.30
+_MIN_TARGET_DISTANCE_M = 0.45
+_TARGET_SWITCH_BONUS = 0.75
+_REAR_TARGET_PENALTY = 2.4
+_DEFER_TARGET_STEPS = 18
+_DEGRADED_HANDOFF_MAX_DURATION_S = 0.75
+_DEGRADED_HANDOFF_MAX_DISTANCE_M = 0.20
+_DEGRADED_FORWARD_GEOMETRY_RAD = math.radians(55.0)
+_DEGRADED_TURN_GEOMETRY_RAD = math.radians(100.0)
+_TURN_BIAS_WINDOW_S = 0.60
+_TURN_BIAS_MIN_RATE_RAD_S = math.radians(8.0)
+_ANCHOR_TARGET_SLACK_M = 0.30
 # Scan slice thickness (robot-frame z). Matches ScanConfig defaults so
 # the grid and the reactive scan pipeline see the same world.
 _MIN_HEIGHT_M = 0.02
@@ -96,6 +111,307 @@ class GridSnapshot:
     coverage_ratio: float
     last_health: HealthState
     writes_since_reset: int
+
+
+@dataclass
+class _DegradedHandoff:
+    target_cell: tuple[int, int]
+    mode: PlannerMode
+    started_t: float
+    origin_xy_m: tuple[float, float]
+
+
+class RollingFrontierPlanner:
+    """Planner-facing wrapper around ``RollingFrontierGrid``.
+
+    This mirrors the coarse frontier selection behavior of the legacy
+    fixed-world planner but consumes the rolling window and ``PoseEstimate``
+    directly. Write gating stays inside the grid; command gating happens here.
+
+    Conservative behavior:
+    - ``HEALTHY`` + ``xy_m`` present: full frontier selection.
+    - ``DEGRADED``: may continue the existing in-flight target briefly, but
+      never select a new one.
+    - ``BROKEN`` or ``xy_m=None``: hold position.
+    """
+
+    def __init__(self, config: RollingGridConfig | None = None) -> None:
+        self._grid = RollingFrontierGrid(config)
+        self._selected_frontier_cell: tuple[int, int] | None = None
+        self._selected_frontier_age = 0
+        self._deferred_targets: dict[tuple[int, int], int] = {}
+        self._tick = 0
+        self._last_command = PlannerCommand(mode=PlannerMode.HOLD, reason="waiting_for_map")
+        self._degraded_handoff: _DegradedHandoff | None = None
+        self._recent_pose_samples: Deque[tuple[float, float, tuple[float, float]]] = deque()
+
+    @property
+    def grid(self) -> RollingFrontierGrid:
+        return self._grid
+
+    def defer_target(self, cell: tuple[int, int] | None) -> None:
+        if cell is None:
+            return
+        self._deferred_targets[cell] = self._tick + _DEFER_TARGET_STEPS
+        if self._selected_frontier_cell == cell:
+            self._selected_frontier_cell = None
+            self._selected_frontier_age = 0
+
+    def update_from_frame(self, pose: PoseEstimate, points_robot_xyz: np.ndarray) -> None:
+        self._grid.update_from_frame(pose, points_robot_xyz)
+
+    def command_for_pose(self, pose: PoseEstimate) -> PlannerCommand:
+        self._tick += 1
+        expired = [cell for cell, until in self._deferred_targets.items() if until <= self._tick]
+        for cell in expired:
+            self._deferred_targets.pop(cell, None)
+
+        if pose.xy_m is None:
+            self._degraded_handoff = None
+            self._last_command = PlannerCommand(mode=PlannerMode.HOLD, reason="translation_unavailable", confidence=0.0)
+            return self._last_command
+        if pose.health == HealthState.BROKEN:
+            self._degraded_handoff = None
+            self._last_command = PlannerCommand(mode=PlannerMode.HOLD, reason="pose_broken", confidence=0.0)
+            return self._last_command
+        if pose.health == HealthState.DEGRADED:
+            return self._command_for_degraded_pose(pose)
+
+        self._degraded_handoff = None
+        if pose.health != HealthState.HEALTHY:
+            self._last_command = PlannerCommand(mode=PlannerMode.HOLD, reason=f"pose_{pose.health.value}", confidence=0.0)
+            return self._last_command
+        self._record_pose_sample(pose)
+        if self._recent_turn_in_place_motion(pose):
+            self._selected_frontier_cell = None
+            self._selected_frontier_age = 0
+            self._last_command = PlannerCommand(
+                mode=PlannerMode.TURN,
+                target_heading=pose.yaw_rad + math.radians(18.0),
+                reason="recent_turn_motion",
+                confidence=0.2,
+            )
+            return self._last_command
+
+        frontiers = self._grid.frontier_clusters()
+        if not frontiers:
+            self._selected_frontier_cell = None
+            self._selected_frontier_age = 0
+            self._last_command = PlannerCommand(
+                mode=PlannerMode.TURN,
+                target_heading=pose.yaw_rad + math.radians(25.0),
+                reason="no_frontier_scan",
+                confidence=0.2,
+            )
+            return self._last_command
+
+        selection = self._select_frontier(pose, frontiers)
+        if selection is None:
+            self._selected_frontier_cell = None
+            self._selected_frontier_age = 0
+            self._last_command = PlannerCommand(
+                mode=PlannerMode.TURN,
+                target_heading=pose.yaw_rad + math.radians(20.0),
+                reason="frontier_too_close",
+                confidence=0.15,
+            )
+            return self._last_command
+
+        best_cell, best_score = selection
+        if self._selected_frontier_cell == best_cell:
+            self._selected_frontier_age += 1
+        else:
+            self._selected_frontier_cell = best_cell
+            self._selected_frontier_age = 1
+
+        target_world = self._grid.cell_to_world(*best_cell)
+        dx = target_world[0] - pose.xy_m[0]
+        dy = target_world[1] - pose.xy_m[1]
+        target_heading = math.atan2(dy, dx)
+        heading_error = self._wrap_angle(target_heading - pose.yaw_rad)
+        distance = math.hypot(dx, dy)
+
+        if distance <= _FRONTIER_REACHED_M:
+            cmd = PlannerCommand(
+                mode=PlannerMode.TURN,
+                target_heading=target_heading + math.radians(20.0),
+                target_cell=best_cell,
+                reason="frontier_reached_reorient",
+                confidence=min(1.0, best_score),
+            )
+        elif abs(heading_error) > _TURN_IN_PLACE_RAD:
+            cmd = PlannerCommand(
+                mode=PlannerMode.TURN,
+                target_heading=target_heading,
+                target_cell=best_cell,
+                reason="align_frontier",
+                confidence=min(1.0, best_score),
+            )
+        else:
+            cmd = PlannerCommand(
+                mode=PlannerMode.APPROACH_FRONTIER if abs(heading_error) < _FORWARD_HEADING_RAD else PlannerMode.FORWARD,
+                target_heading=target_heading,
+                target_cell=best_cell,
+                reason="approach_frontier",
+                confidence=min(1.0, best_score),
+            )
+
+        self._last_command = cmd
+        return cmd
+
+    def _command_for_degraded_pose(self, pose: PoseEstimate) -> PlannerCommand:
+        assert pose.xy_m is not None
+        if self._degraded_handoff is None:
+            self._degraded_handoff = self._begin_degraded_handoff(pose)
+        if self._degraded_handoff is None:
+            self._last_command = PlannerCommand(mode=PlannerMode.HOLD, reason="pose_degraded", confidence=0.0)
+            return self._last_command
+
+        handoff = self._degraded_handoff
+        if (pose.t_monotonic - handoff.started_t) > _DEGRADED_HANDOFF_MAX_DURATION_S:
+            self._degraded_handoff = None
+            self._last_command = PlannerCommand(mode=PlannerMode.HOLD, reason="pose_degraded_timeout", confidence=0.0)
+            return self._last_command
+
+        if math.hypot(
+            pose.xy_m[0] - handoff.origin_xy_m[0],
+            pose.xy_m[1] - handoff.origin_xy_m[1],
+        ) > _DEGRADED_HANDOFF_MAX_DISTANCE_M:
+            self._degraded_handoff = None
+            self._last_command = PlannerCommand(mode=PlannerMode.HOLD, reason="pose_degraded_distance_limit", confidence=0.0)
+            return self._last_command
+
+        target_world = self._grid.cell_to_world(*handoff.target_cell)
+        dx = target_world[0] - pose.xy_m[0]
+        dy = target_world[1] - pose.xy_m[1]
+        distance = math.hypot(dx, dy)
+        if distance <= _FRONTIER_REACHED_M:
+            self._degraded_handoff = None
+            self._last_command = PlannerCommand(mode=PlannerMode.HOLD, reason="pose_degraded_complete", confidence=0.0)
+            return self._last_command
+
+        target_heading = math.atan2(dy, dx)
+        heading_error = abs(self._wrap_angle(target_heading - pose.yaw_rad))
+        geometry_limit = (
+            _DEGRADED_TURN_GEOMETRY_RAD
+            if handoff.mode == PlannerMode.TURN
+            else _DEGRADED_FORWARD_GEOMETRY_RAD
+        )
+        if heading_error > geometry_limit:
+            self._degraded_handoff = None
+            self._last_command = PlannerCommand(mode=PlannerMode.HOLD, reason="pose_degraded_bad_geometry", confidence=0.0)
+            return self._last_command
+
+        self._last_command = PlannerCommand(
+            mode=handoff.mode,
+            target_heading=target_heading,
+            target_cell=handoff.target_cell,
+            reason="pose_degraded_continue",
+            confidence=min(self._last_command.confidence, 0.35),
+        )
+        return self._last_command
+
+    def _begin_degraded_handoff(self, pose: PoseEstimate) -> _DegradedHandoff | None:
+        assert pose.xy_m is not None
+        if self._selected_frontier_cell is None:
+            return None
+        if self._last_command.mode not in {PlannerMode.TURN, PlannerMode.FORWARD, PlannerMode.APPROACH_FRONTIER}:
+            return None
+        return _DegradedHandoff(
+            target_cell=self._selected_frontier_cell,
+            mode=self._last_command.mode,
+            started_t=pose.t_monotonic,
+            origin_xy_m=pose.xy_m,
+        )
+
+    def _record_pose_sample(self, pose: PoseEstimate) -> None:
+        assert pose.xy_m is not None
+        self._recent_pose_samples.append((pose.t_monotonic, pose.yaw_rad, pose.xy_m))
+        cutoff = pose.t_monotonic - _TURN_BIAS_WINDOW_S
+        while len(self._recent_pose_samples) >= 2 and self._recent_pose_samples[1][0] < cutoff:
+            self._recent_pose_samples.popleft()
+
+    def _recent_turn_in_place_motion(self, pose: PoseEstimate) -> bool:
+        if pose.xy_m is None or len(self._recent_pose_samples) < 2:
+            return False
+        oldest_t, oldest_yaw, _oldest_xy = self._recent_pose_samples[0]
+        dt = pose.t_monotonic - oldest_t
+        if dt <= 1e-6:
+            return False
+        yaw_rate = abs(pose.yaw_rad - oldest_yaw) / dt
+        return yaw_rate >= _TURN_BIAS_MIN_RATE_RAD_S
+
+    def snapshot(self) -> PlannerSnapshot:
+        snap = self._grid.snapshot()
+        selected = None
+        if self._selected_frontier_cell is not None:
+            selected = self._grid.cell_to_world(*self._selected_frontier_cell)
+        return PlannerSnapshot(
+            planner_mode=self._last_command.mode.value,
+            frontier_count=len(self._grid.frontier_clusters()),
+            selected_frontier=selected,
+            coverage_ratio=snap.coverage_ratio,
+            free_cells=snap.free_cells,
+            occupied_cells=snap.occupied_cells,
+            unknown_cells=snap.unknown_cells,
+            reason=self._last_command.reason,
+        )
+
+    @property
+    def selected_frontier_cell(self) -> tuple[int, int] | None:
+        return self._selected_frontier_cell
+
+    def _select_frontier(
+        self,
+        pose: PoseEstimate,
+        clusters: list[list[tuple[int, int]]],
+    ) -> tuple[tuple[int, int], float] | None:
+        assert pose.xy_m is not None
+        cur_x, cur_y = pose.xy_m
+        heading = pose.yaw_rad
+        anchor_x, anchor_y = self._grid.anchor_xy_m
+        pose_anchor_dist = math.hypot(cur_x - anchor_x, cur_y - anchor_y)
+        best_cell = clusters[0][0]
+        best_score = -1e9
+        any_far_target = False
+        for cluster in clusters:
+            rows = np.array([c[0] for c in cluster], dtype=np.float32)
+            cols = np.array([c[1] for c in cluster], dtype=np.float32)
+            center_cell = (int(round(rows.mean())), int(round(cols.mean())))
+            wx, wy = self._grid.cell_to_world(*center_cell)
+            dist = math.hypot(wx - cur_x, wy - cur_y)
+            if dist < _MIN_TARGET_DISTANCE_M:
+                continue
+            target_anchor_dist = math.hypot(wx - anchor_x, wy - anchor_y)
+            if target_anchor_dist + _ANCHOR_TARGET_SLACK_M < pose_anchor_dist:
+                continue
+            any_far_target = True
+            target_heading = math.atan2(wy - cur_y, wx - cur_x)
+            heading_cost = abs(self._wrap_angle(target_heading - heading))
+            info_gain = len(cluster)
+            score = (info_gain * 0.35) - (dist * 0.55) - (heading_cost * 0.90)
+            if heading_cost < math.radians(35.0):
+                score += 0.8
+            if heading_cost > math.pi / 2:
+                score -= _REAR_TARGET_PENALTY * ((heading_cost - (math.pi / 2)) / (math.pi / 2))
+            if center_cell in self._deferred_targets:
+                score -= 10.0
+            if self._selected_frontier_cell == center_cell:
+                score += _TARGET_SWITCH_BONUS
+            if score > best_score:
+                best_cell = center_cell
+                best_score = score
+        if not any_far_target:
+            return None
+        return best_cell, best_score
+
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        while angle <= -math.pi:
+            angle += 2 * math.pi
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        return angle
 
 
 class RollingFrontierGrid:
@@ -382,5 +698,6 @@ __all__ = [
     "PlannerMode",
     "PlannerSnapshot",
     "RollingFrontierGrid",
+    "RollingFrontierPlanner",
     "RollingGridConfig",
 ]
