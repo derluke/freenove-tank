@@ -1,9 +1,10 @@
 """Replay a recorded dataset through the Phase 1 reactive safety stack.
 
-For each frame:
+For each frame event in monotonic time order:
 1. Load the BGR image.
 2. Run Depth Anything V2 inference to get a metric depth map.
-3. Feed the depth map through `ReactiveSafety.tick()`.
+3. Feed the depth map plus the latest IMU/telemetry state through
+   `ReactiveSafety.tick()`.
 4. Render an annotated visualization panel: camera frame | colorized
    depth | occupancy grid (top-down) | text overlay with motor intent,
    veto state, clearances, and timing.
@@ -25,9 +26,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from tankbot.desktop.autonomy.dataset import iter_frame_records
+from tankbot.desktop.autonomy.dataset import (
+    FrameRecord,
+    ImuRecord,
+    TelemetryRecord,
+    iter_dataset_events,
+)
 from tankbot.desktop.autonomy.depth import build_estimator
 from tankbot.desktop.autonomy.reactive import (
+    GyroPoseSource,
+    GyroIntegrator,
     ReactiveSafety,
     SafetyTick,
     load_extrinsics,
@@ -37,7 +45,6 @@ from tankbot.desktop.autonomy.reactive.grid import (
     CELL_OCCUPIED,
     ReactiveGrid,
 )
-from tankbot.desktop.autonomy.reactive.pose import NullPoseSource
 
 # Defaults — override via CLI flags.
 _DEFAULT_DEPTH_BACKEND = "depth_anything_v2"
@@ -98,6 +105,8 @@ def _render_text_panel(tick: SafetyTick, depth_ms: float, frame_idx: int) -> np.
         f"Decision: {tick.decision.reason}",
         f"L={tick.decision.left_duty:+5d}  R={tick.decision.right_duty:+5d}",
         f"State: {tick.decision.state.value}",
+        f"Yaw: {np.degrees(tick.pose.yaw_rad):+.1f} deg ({tick.pose.health.value})",
+        f"Near-field veto: {'YES' if tick.near_field_veto else 'no'}",
         "",
         f"Stop zone: {'BLOCKED' if tick.stop_zone_blocked else 'clear'} ({tick.stop_zone_count} cells)",
         f"Fwd:  {tick.clearance_forward_m:.2f} m",
@@ -167,28 +176,39 @@ def main(argv: list[str] | None = None) -> None:
     print("Depth backend ready.")
 
     # --- build reactive stack ---
-    pose_source = NullPoseSource()
+    gyro = GyroIntegrator()
+    pose_source = GyroPoseSource(gyro)
     safety = ReactiveSafety(
         intrinsics=intrinsics,
         extrinsics=extrinsics,
         pose_source=pose_source,
     )
 
-    # --- iterate frames ---
-    frames = list(iter_frame_records(args.dataset))
-    if not frames:
-        print(f"No frames found in {args.dataset}", file=sys.stderr)
-        sys.exit(1)
+    # --- iterate events ---
+    frame_count = 0
+    ultrasonic_m: float | None = None
+    print(f"Replaying events from {args.dataset} ...")
 
-    if args.max_frames:
-        frames = frames[: args.max_frames]
+    for event in iter_dataset_events(args.dataset):
+        payload = event.payload
+        if event.channel == "imu" and isinstance(payload, ImuRecord):
+            gyro.add_sample(payload.gz, t=payload.t_monotonic)
+            continue
+        if event.channel == "telemetry" and isinstance(payload, TelemetryRecord):
+            raw_cm = payload.payload.get("distance", -1)
+            if isinstance(raw_cm, (int, float)) and raw_cm > 0:
+                ultrasonic_m = float(raw_cm) / 100.0
+            continue
+        if event.channel != "frame" or not isinstance(payload, FrameRecord):
+            continue
 
-    print(f"Replaying {len(frames)} frames ...")
+        frame_count += 1
+        if args.max_frames is not None and frame_count > args.max_frames:
+            break
 
-    for i, frame_rec in enumerate(frames):
-        bgr = cv2.imread(str(frame_rec.path))
+        bgr = cv2.imread(str(payload.path))
         if bgr is None:
-            print(f"  skip {frame_rec.path} (unreadable)")
+            print(f"  skip {payload.path} (unreadable)")
             continue
 
         # Depth inference.
@@ -197,16 +217,20 @@ def main(argv: list[str] | None = None) -> None:
         depth_ms = (time.monotonic() - t0) * 1000.0
 
         # Reactive tick.
-        tick = safety.tick(depth_result.depth_m, t_now=frame_rec.t_monotonic)
+        tick = safety.tick(
+            depth_result.depth_m,
+            ultrasonic_m=ultrasonic_m,
+            t_now=payload.t_monotonic,
+        )
 
         # Visualization.
         depth_color = _colorize_depth(depth_result.depth_m)
-        grid_img = _render_grid(safety._grid, tick)
-        text_img = _render_text_panel(tick, depth_ms, frame_rec.index)
+        grid_img = _render_grid(safety.grid, tick)
+        text_img = _render_text_panel(tick, depth_ms, payload.index)
         panel = _compose_panel(bgr, depth_color, grid_img, text_img)
 
         if args.save_dir:
-            out_path = args.save_dir / f"reactive_{frame_rec.index:06d}.png"
+            out_path = args.save_dir / f"reactive_{payload.index:06d}.png"
             cv2.imwrite(str(out_path), panel)
 
         if not args.headless:
@@ -223,9 +247,9 @@ def main(argv: list[str] | None = None) -> None:
                 if key2 == ord("q"):
                     break
 
-        if (i + 1) % 50 == 0 or i == len(frames) - 1:
+        if frame_count % 50 == 0:
             print(
-                f"  [{i + 1}/{len(frames)}] depth={depth_ms:.0f}ms "
+                f"  [{frame_count}] depth={depth_ms:.0f}ms "
                 f"reactive={tick.total_ms:.1f}ms "
                 f"{'BLOCKED' if tick.stop_zone_blocked else 'clear'} "
                 f"L={tick.decision.left_duty:+d} R={tick.decision.right_duty:+d}"

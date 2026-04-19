@@ -7,14 +7,14 @@
 # Robot frame: +x forward, +y left, +z up, origin at chassis center at
 # floor level.
 #
-# These defaults are EYEBALL estimates — replace with real measurements
-# before trusting the reactive safety layer in the live loop.
+# Measured 2026-04-19: camera is fixed, mounted ~5.3 cm above floor,
+# pointed roughly horizontal (no intentional tilt).
 
 # Camera optical center above the floor (meters).
-height_m: 0.12
+height_m: 0.053
 
 # Camera pitch: positive = tilted downward. Degrees.
-pitch_deg: 8.0
+pitch_deg: -4.5
 
 # Camera yaw relative to robot forward. Positive = rotated left. Degrees.
 yaw_deg: 0.0

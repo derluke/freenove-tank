@@ -1,17 +1,15 @@
 """Reactive safety layer (Phase 1 of the autonomy redesign).
 
 Entry points:
-- `PoseEstimate`, `PoseSource`, `NullPoseSource` — pose abstraction shared
-  with later phases (§3.2 of docs/autonomy_perception_redesign.md).
+- `PoseEstimate`, `PoseSource`, `NullPoseSource`, `GyroPoseSource` —
+  pose abstraction shared with later phases (§3.2 of
+  docs/autonomy_perception_redesign.md).
 - `CameraExtrinsics` — one-time static calibration consumed by projection.
 - `project_depth_to_robot_points` — depth + extrinsics + intrinsics → robot
   frame point cloud.
 - `ReactiveGrid` — robot-centric 2D occupancy grid with stop-zone queries.
 - `ReactiveSafety` — orchestrator that turns depth + ultrasonic + pose into
   a motor command with veto rationale.
-
-Nothing in this package currently touches the live robot path — it is
-exercised from `replay_reactive.py` against recorded datasets.
 """
 
 from __future__ import annotations
@@ -32,6 +30,7 @@ from tankbot.desktop.autonomy.reactive.policy import (
     WanderState,
 )
 from tankbot.desktop.autonomy.reactive.pose import (
+    GyroPoseSource,
     HealthState,
     NullPoseSource,
     PoseEstimate,
@@ -57,6 +56,7 @@ __all__ = [
     "CameraExtrinsics",
     "CameraIntrinsics",
     "GyroIntegrator",
+    "GyroPoseSource",
     "HealthState",
     "ICPConfig",
     "MatchResult",

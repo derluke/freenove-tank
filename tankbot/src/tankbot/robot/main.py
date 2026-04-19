@@ -225,6 +225,8 @@ class Robot:
                         {
                             "type": "imu",
                             "t": asyncio.get_running_loop().time(),
+                            "motor_left": self.left_speed,
+                            "motor_right": self.right_speed,
                             **self._latest_imu,
                         }
                     )

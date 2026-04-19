@@ -65,7 +65,7 @@ tasks:
   pi:start:
     desc: Start the robot server on the Pi
     cmds:
-      - ssh -t {{.PI_USER}}@{{.PI_HOST}} "cd {{.PI_DIR}} && ~/.local/bin/uv run tankbot-robot"
+      - ssh -t {{.PI_USER}}@{{.PI_HOST}} "cd {{.PI_DIR}} && ~/.local/bin/uv run --extra robot tankbot-robot"
 
   pi:stop:
     desc: Stop the robot server on the Pi
@@ -238,6 +238,78 @@ tasks:
         --max-frames {{default "600" .MAX_FRAMES}}
         --duration {{default "0" .DURATION}}
 
+  record:phase0c:
+    desc: Record a multi-channel dataset (frames + telemetry + IMU + motor) for Phase 0c replay eval
+    cmds:
+      - >-
+        uv run tankbot-record-robot-stream
+        --robot ws://{{.PI_HOST}}:9000
+        --output-dir recordings/phase0c/{{default "latest" .RUN}}
+        --max-frames {{default "2000" .MAX_FRAMES}}
+        --duration {{default "60" .DURATION}}
+
+  replay:scanmatch:
+    desc: Replay a recorded dataset through the scan-match pipeline (with IMU + motor gating)
+    preconditions:
+      - sh: test -n "{{.DATASET}}"
+        msg: Set DATASET to a recording dir, e.g. `task replay:scanmatch DATASET=recordings/phase0c/latest`
+    cmds:
+      - >-
+        uv run tankbot-replay-scanmatch
+        --dataset {{.DATASET}}
+        {{if .HEADLESS}}--headless{{end}}
+        {{if .MAX_FRAMES}}--max-frames {{.MAX_FRAMES}}{{end}}
+
+  scanmatch:eval:
+    desc: Evaluate one scan-match config against a recorded dataset (needs ground_truth.json)
+    preconditions:
+      - sh: test -n "{{.DATASET}}"
+        msg: Set DATASET to a recording dir, e.g. `task scanmatch:eval DATASET=recordings/phase0c/straight_2m`
+    cmds:
+      - >-
+        uv run --extra desktop tankbot-scanmatch-eval eval
+        --dataset {{.DATASET}}
+        {{if .REBUILD}}--rebuild-cache{{end}}
+
+  scanmatch:sweep:
+    desc: Grid-sweep scan-match thresholds against a recording (caches depth inference across runs)
+    preconditions:
+      - sh: test -n "{{.DATASET}}"
+        msg: Set DATASET to a recording dir, e.g. `task scanmatch:sweep DATASET=recordings/phase0c/straight_2m`
+    cmds:
+      - >-
+        uv run --extra desktop tankbot-scanmatch-eval sweep
+        --dataset {{.DATASET}}
+        {{if .SAVE_JSON}}--save-json {{.SAVE_JSON}}{{end}}
+        {{if .REBUILD}}--rebuild-cache{{end}}
+
+  frontier:replay:
+    desc: Replay a recording through the rolling frontier grid (uses scan-match pose + health gating)
+    preconditions:
+      - sh: test -n "{{.DATASET}}"
+        msg: Set DATASET to a recording dir, e.g. `task frontier:replay DATASET=recordings/phase0c/straight_2m`
+    cmds:
+      - >-
+        uv run --extra desktop tankbot-replay-frontier
+        --dataset {{.DATASET}}
+        {{if .RENDER_DIR}}--render-dir {{.RENDER_DIR}}{{end}}
+        {{if .MAX_FRAMES}}--max-frames {{.MAX_FRAMES}}{{end}}
+        {{if .REBUILD}}--rebuild-cache{{end}}
+
+  projection:inspect:
+    desc: Render per-pixel depth→robot-frame→scan-band diagnostic for a single frame
+    preconditions:
+      - sh: test -n "{{.DATASET}}"
+        msg: Set DATASET to a recording dir, e.g. `task projection:inspect DATASET=recordings/phase0c/straight_1m_1 FRAME=120`
+    cmds:
+      - >-
+        uv run --extra desktop tankbot-projection-inspect
+        --dataset {{.DATASET}}
+        {{if .FRAME}}--frame {{.FRAME}}{{end}}
+        {{if .OUTPUT}}--output {{.OUTPUT}}{{end}}
+        {{if .BACKEND}}--backend {{.BACKEND}}{{end}}
+        {{if .DEPTH_SCALE}}--depth-scale {{.DEPTH_SCALE}}{{end}}
+
   vision:vanilla:mast3r:
     desc: Run upstream MASt3R-SLAM on a recorded raw frame folder
     preconditions:
@@ -383,11 +455,27 @@ tasks:
     cmds:
       - uv run --dev mypy {{.LOCAL_DIR}}/src/tankbot
 
+  test:
+    desc: Run the fast test suite (skips slow scan-match regression tests)
+    cmds:
+      - uv run --dev --extra desktop pytest -m "not slow"
+
+  test:slow:
+    desc: Run the slow regression tests (needs cached observations_*.npz — see scanmatch:eval)
+    cmds:
+      - uv run --dev --extra desktop pytest -m slow
+
+  test:all:
+    desc: Run the full test suite (fast + slow)
+    cmds:
+      - uv run --dev --extra desktop pytest
+
   check:
-    desc: Run all checks (lint + typecheck + format check)
+    desc: Run all checks (lint + typecheck + fast tests + format check)
     cmds:
       - task: lint
       - task: typecheck
+      - task: test
       - uv run --dev ruff format --check {{.LOCAL_DIR}}/src
 
   # ---------------------------------------------------------------------------

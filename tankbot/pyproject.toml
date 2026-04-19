@@ -48,6 +48,9 @@ tankbot-benchmark-depth = "tankbot.desktop.autonomy.benchmark_depth:main"
 tankbot-replay-reactive = "tankbot.desktop.autonomy.replay_reactive:main"
 tankbot-reactive = "tankbot.desktop.autonomy.reactive_engine:main"
 tankbot-replay-scanmatch = "tankbot.desktop.autonomy.replay_scanmatch:main"
+tankbot-scanmatch-eval = "tankbot.desktop.autonomy.scanmatch_eval:main"
+tankbot-replay-frontier = "tankbot.desktop.autonomy.replay_frontier:main"
+tankbot-projection-inspect = "tankbot.desktop.autonomy.projection_inspect:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -123,4 +126,16 @@ dev = [
     "mypy>=1.20.0",
     "pytest>=9.0.3",
     "ruff>=0.15.10",
+]
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# -ra: show summary of non-pass outcomes (skips, xfails) so silent skips don't
+# hide test-surface regressions.
+addopts = "-ra"
+markers = [
+    "slow: tests that depend on large cached artifacts (observations_*.npz) or GPU inference; run with `-m slow` to include",
 ]

@@ -27,8 +27,11 @@ import numpy as np
 class ScanConfig:
     """Parameters for synthetic 2D scan extraction."""
 
-    n_bins: int = 180
-    """Number of angular bins. 180 bins over 180 deg = 1 deg resolution."""
+    n_bins: int = 120
+    """Number of angular bins. 120 bins over 180 deg = 1.5 deg resolution.
+
+    Slightly coarser bins are more robust to monocular depth jitter while
+    still preserving enough angular detail for the current matcher."""
 
     min_angle_rad: float = -np.pi / 2
     """Start angle (rad). Default -pi/2 (right)."""
@@ -45,10 +48,19 @@ class ScanConfig:
     min_height_m: float = 0.02
     """Floor-parallel slice lower bound (robot frame z)."""
 
-    max_height_m: float = 0.35
+    max_height_m: float = 0.30
     """Floor-parallel slice upper bound (robot frame z).
     Only points in this band contribute to the scan — this
     filters out floor and ceiling returns."""
+
+    range_percentile: float = 35.0
+    """Per-bin range reducer percentile.
+
+    Monocular depth regularly produces a few spuriously-near points in an
+    angular bin. Using the raw minimum makes those outliers dominate the
+    synthetic scan and corrupt forward translation. A low-ish percentile
+    keeps the scan tied to the dominant surface while still favoring the
+    nearer obstacle in a bin."""
 
 
 @dataclass(frozen=True)
@@ -146,9 +158,18 @@ def extract_scan(
     if r.shape[0] == 0:
         return Scan2D(ranges=ranges, angles=angles, config=cfg, n_valid_bins=0)
 
-    # Take the minimum range per bin (nearest obstacle).
-    # np.minimum.at does unbuffered in-place reduction.
-    np.minimum.at(ranges, bin_idx, r.astype(np.float32))
+    # Reduce each angular bin to a robust range estimate. A raw minimum is
+    # too sensitive to monocular-depth speckles that land slightly in front
+    # of the true wall; a low percentile preserves obstacle ordering while
+    # ignoring one-off near outliers.
+    q = float(np.clip(cfg.range_percentile, 0.0, 100.0))
+    order = np.argsort(bin_idx)
+    r = r[order]
+    bin_idx = bin_idx[order]
+    unique_bins, start_idx = np.unique(bin_idx, return_index=True)
+    end_idx = np.r_[start_idx[1:], len(bin_idx)]
+    for b, start, end in zip(unique_bins, start_idx, end_idx, strict=False):
+        ranges[int(b)] = float(np.percentile(r[start:end], q))
 
     n_valid = int(np.sum(ranges < cfg.max_range_m))
     return Scan2D(ranges=ranges, angles=angles, config=cfg, n_valid_bins=n_valid)

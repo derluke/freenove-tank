@@ -40,6 +40,10 @@ class ImuRecord:
     ax: float = 0.0
     ay: float = 0.0
     az: float = 0.0
+    # Motor state piggybacked on IMU broadcast (50 Hz). None when the
+    # recording predates the piggyback (schema v2 datasets without motor).
+    motor_left: int | None = None
+    motor_right: int | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,16 @@ class DatasetWriter:
 
     def open(self) -> None:
         self._output_dir.mkdir(parents=True, exist_ok=True)
+        # Refuse to concatenate into an existing recording. The append mode
+        # below would otherwise silently merge two runs, producing a dataset
+        # with a time gap that corrupts scan-matching across the boundary.
+        if self._frame_log.exists() and self._frame_log.stat().st_size > 0:
+            msg = (
+                f"{self._output_dir} already contains {FRAME_LOG_NAME}; refusing "
+                "to append to an existing recording. Delete the directory or "
+                "pick a fresh output path."
+            )
+            raise FileExistsError(msg)
         self._frame_fp = self._frame_log.open("a", encoding="utf-8")
         self._telemetry_fp = self._telemetry_log.open("a", encoding="utf-8")
         self._imu_fp = self._imu_log.open("a", encoding="utf-8")
@@ -119,19 +133,21 @@ class DatasetWriter:
 
     def write_imu(self, payload: dict[str, Any], *, t_monotonic: float, t_wall: float) -> None:
         self._set_start_times(t_monotonic=t_monotonic, t_wall=t_wall)
-        self._write_json_line(
-            self._imu_fp,
-            {
-                "t_monotonic": t_monotonic,
-                "t_wall": t_wall,
-                "gz": payload.get("gz", 0.0),
-                "gx": payload.get("gx", 0.0),
-                "gy": payload.get("gy", 0.0),
-                "ax": payload.get("ax", 0.0),
-                "ay": payload.get("ay", 0.0),
-                "az": payload.get("az", 0.0),
-            },
-        )
+        row: dict[str, Any] = {
+            "t_monotonic": t_monotonic,
+            "t_wall": t_wall,
+            "gz": payload.get("gz", 0.0),
+            "gx": payload.get("gx", 0.0),
+            "gy": payload.get("gy", 0.0),
+            "ax": payload.get("ax", 0.0),
+            "ay": payload.get("ay", 0.0),
+            "az": payload.get("az", 0.0),
+        }
+        if "motor_left" in payload:
+            row["motor_left"] = int(payload["motor_left"])
+        if "motor_right" in payload:
+            row["motor_right"] = int(payload["motor_right"])
+        self._write_json_line(self._imu_fp, row)
         self._imu_written += 1
 
     def close(self, *, status: str = "complete") -> None:
@@ -266,6 +282,8 @@ def iter_imu_records(dataset_dir: Path) -> Iterator[ImuRecord]:
             if not line.strip():
                 continue
             row = json.loads(line)
+            ml = row.get("motor_left")
+            mr = row.get("motor_right")
             yield ImuRecord(
                 t_monotonic=float(row["t_monotonic"]),
                 t_wall=float(row["t_wall"]),
@@ -275,6 +293,8 @@ def iter_imu_records(dataset_dir: Path) -> Iterator[ImuRecord]:
                 ax=float(row.get("ax", 0.0)),
                 ay=float(row.get("ay", 0.0)),
                 az=float(row.get("az", 0.0)),
+                motor_left=int(ml) if ml is not None else None,
+                motor_right=int(mr) if mr is not None else None,
             )
 
 

@@ -6,12 +6,9 @@ safety grid, rolling frontier grid, global consistency. Locking it down
 churn as each new estimator appears.
 
 The concrete `PoseSource` implementations (gyro, scan-match, encoders,
-VIO, AprilTag) will arrive in later phases. For now only `NullPoseSource`
-exists — a stub that always reports HEALTHY yaw=0, xy_m=None. The
-reactive safety layer runs correctly against this stub at its target
-control rate because per-frame decisions do not rely on heading
-integration between frames — see the IMU discussion in the Phase 1
-plan.
+VIO, AprilTag) land incrementally. Phase 1 ships `GyroPoseSource`
+(heading only, `xy_m=None`) and keeps `NullPoseSource` as a replay/unit
+test stub for no-IMU cases.
 """
 
 from __future__ import annotations
@@ -21,6 +18,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+
+from tankbot.desktop.autonomy.reactive.gyro import GyroIntegrator
 
 
 class HealthState(Enum):
@@ -108,5 +107,47 @@ class NullPoseSource(PoseSource):
             xy_m=None,
             xy_var=None,
             health=HealthState.HEALTHY,
+            source=self.source_name,
+        )
+
+
+class GyroPoseSource(PoseSource):
+    """Phase 1 pose source: heading from the IMU gyro, no translation.
+
+    `xy_m` is always `None` by design. Health reflects whether gyro
+    samples have arrived recently enough to trust rotation compensation
+    in the reactive grid.
+    """
+
+    source_name = "gyro"
+
+    def __init__(
+        self,
+        gyro: GyroIntegrator,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        yaw_var: float = 0.001,
+        stale_after_s: float = 0.25,
+    ) -> None:
+        self._gyro = gyro
+        self._clock = clock
+        self._yaw_var = yaw_var
+        self._stale_after_s = stale_after_s
+
+    def latest(self) -> PoseEstimate:
+        now = self._clock()
+        last_sample_t = self._gyro.last_sample_t
+        healthy = (
+            last_sample_t is not None
+            and self._gyro.n_samples > 0
+            and (now - last_sample_t) <= self._stale_after_s
+        )
+        return PoseEstimate(
+            t_monotonic=now,
+            yaw_rad=self._gyro.yaw_rad,
+            yaw_var=self._yaw_var if healthy else self._yaw_var * 100.0,
+            xy_m=None,
+            xy_var=None,
+            health=HealthState.HEALTHY if healthy else HealthState.BROKEN,
             source=self.source_name,
         )

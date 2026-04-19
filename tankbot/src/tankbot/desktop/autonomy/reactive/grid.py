@@ -7,10 +7,9 @@ origin.
 Temporal smoothing: instead of rebuilding from scratch every frame
 (which causes visible flicker), the grid keeps a small ring buffer of
 recent per-frame hit masks and marks a cell OCCUPIED if it was hit in
-*any* of the last `persistence_frames` frames. At 23 Hz with the
-default of 3 frames (~130 ms), the robot moves <3 mm between the
-oldest and newest frame, so smear from the lack of rotation
-compensation is negligible.
+*any* of the last `persistence_frames` frames. Historical masks are
+rotated into the current robot frame using gyro yaw deltas; translation
+over the short persistence window is assumed zero.
 
 Two query methods matter for the reactive layer:
 - `stop_zone_occupied(...)` -- is there an obstacle in a forward wedge
@@ -60,7 +59,7 @@ class ReactiveGrid:
         *,
         half_extent_m: float = 3.0,
         resolution_m: float = 0.05,
-        persistence_frames: int = 3,
+        persistence_frames: int = 7,
     ) -> None:
         if resolution_m <= 0:
             msg = f"resolution_m must be positive, got {resolution_m}"
@@ -81,8 +80,10 @@ class ReactiveGrid:
 
         self._persistence = persistence_frames
 
-        # Ring buffer of recent per-frame boolean hit masks.
-        self._history: deque[np.ndarray] = deque(maxlen=persistence_frames)
+        # Ring buffer of recent per-frame boolean hit masks plus the yaw
+        # they were observed at. Old masks are rotated into the current
+        # robot frame on rebuild.
+        self._history: deque[tuple[np.ndarray, float]] = deque(maxlen=persistence_frames)
 
         # Cell (row=0, col=0) corresponds to robot-frame (-half, -half).
         # Row index grows with +x (forward). Col index grows with +y (left).
@@ -104,17 +105,32 @@ class ReactiveGrid:
     def cells(self) -> np.ndarray:
         return self._cells
 
+    @property
+    def persistence_frames(self) -> int:
+        return self._persistence
+
     def clear(self) -> None:
         self._cells.fill(CELL_UNKNOWN)
         self._history.clear()
 
-    def build_from_points(self, points_xyz: np.ndarray) -> None:
+    def set_persistence_frames(self, persistence_frames: int) -> None:
+        """Update history length with minimal state loss."""
+        if persistence_frames < 1:
+            msg = f"persistence_frames must be >= 1, got {persistence_frames}"
+            raise ValueError(msg)
+        if persistence_frames == self._persistence:
+            return
+        history = list(self._history)[-persistence_frames:]
+        self._persistence = persistence_frames
+        self._history = deque(history, maxlen=persistence_frames)
+
+    def build_from_points(self, points_xyz: np.ndarray, *, yaw_rad: float = 0.0) -> None:
         """Integrate a new frame of obstacle points into the grid.
 
         A boolean hit mask for this frame is pushed into the ring buffer.
         The composite grid marks a cell OCCUPIED if it was hit in *any*
-        frame still in the buffer, giving short temporal persistence
-        without requiring rotation compensation.
+        frame still in the buffer. Historical masks are rotated by the
+        change in robot yaw so persistence survives short in-place turns.
         """
         if points_xyz.ndim != 2 or points_xyz.shape[1] != 3:
             msg = f"points_xyz must be (N, 3), got {points_xyz.shape}"
@@ -133,12 +149,48 @@ class ReactiveGrid:
             if rows.size > 0:
                 hit[rows, cols] = True
 
-        self._history.append(hit)
+        self._history.append((hit, yaw_rad))
 
-        # Rebuild composite: union of all frames in the buffer.
+        # Rebuild composite: union of all frames in the buffer, rotated
+        # into the current robot frame.
         self._cells.fill(CELL_UNKNOWN)
-        for frame_hit in self._history:
-            self._cells[frame_hit] = CELL_OCCUPIED
+        for frame_hit, frame_yaw in self._history:
+            if not frame_hit.any():
+                continue
+            rotated = self._rotate_hit_mask(frame_hit, yaw_rad - frame_yaw)
+            self._cells[rotated] = CELL_OCCUPIED
+
+    def _rotate_hit_mask(self, hit: np.ndarray, delta_yaw_rad: float) -> np.ndarray:
+        """Rotate a historical hit mask into the current robot frame."""
+        if not hit.any():
+            return hit
+        if abs(delta_yaw_rad) < 1e-6:
+            return hit
+
+        rows, cols = np.nonzero(hit)
+        x = (rows.astype(np.float32) + 0.5) * self._resolution_m - self._half_extent_m
+        y = (cols.astype(np.float32) + 0.5) * self._resolution_m - self._half_extent_m
+
+        # Historical robot frame -> current robot frame. If the robot has
+        # turned left by +delta, a world-fixed obstacle moves right in the
+        # current robot frame, so apply the inverse rotation (-delta).
+        c = math.cos(delta_yaw_rad)
+        s = math.sin(delta_yaw_rad)
+        x_cur = c * x + s * y
+        y_cur = -s * x + c * y
+
+        rot_rows = np.floor((x_cur + self._half_extent_m) / self._resolution_m).astype(np.int32)
+        rot_cols = np.floor((y_cur + self._half_extent_m) / self._resolution_m).astype(np.int32)
+        inside = (
+            (rot_rows >= 0)
+            & (rot_rows < self._size)
+            & (rot_cols >= 0)
+            & (rot_cols < self._size)
+        )
+
+        rotated = np.zeros_like(hit)
+        rotated[rot_rows[inside], rot_cols[inside]] = True
+        return rotated
 
     # ------------------------------------------------------------------
     # Queries

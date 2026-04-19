@@ -71,9 +71,12 @@ class ICPConfig:
     """Reject point pairs farther apart than this (meters). Rejects
     outliers from dynamic objects or scan edges."""
 
-    min_valid_bins: int = 20
+    min_valid_bins: int = 10
     """Minimum number of valid bins in both scans to attempt matching.
-    Below this, the scan is too sparse for reliable matching."""
+    Below this, the scan is too sparse for reliable matching. Lowered
+    from 20 after the Phase 0c `straight_2m` sweep — monocular depth
+    regularly produces scans with 10-30 valid bins, and 20 was rejecting
+    usable matches."""
 
     rotation_prior_weight: float = 20.0
     """When a gyro rotation prior is provided, this weight (relative to

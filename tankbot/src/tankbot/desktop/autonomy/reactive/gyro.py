@@ -52,6 +52,11 @@ class GyroIntegrator:
         return self._yaw_rad
 
     @property
+    def last_sample_t(self) -> float | None:
+        """Monotonic timestamp of the most recent gyro sample."""
+        return self._last_t
+
+    @property
     def n_samples(self) -> int:
         return self._n_samples
 
