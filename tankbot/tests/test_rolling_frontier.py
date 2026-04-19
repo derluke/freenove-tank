@@ -145,3 +145,24 @@ def test_planner_degraded_handoff_times_out_to_hold() -> None:
 
     assert cmd.mode == PlannerMode.HOLD
     assert cmd.reason == "pose_degraded_timeout"
+
+
+def test_planner_requires_stable_healthy_window_after_degraded() -> None:
+    planner = RollingFrontierPlanner()
+    grid = planner.grid
+    grid._free_hits[58:61, 68:71] = 3  # noqa: SLF001
+
+    first_cmd = planner.command_for_pose(_pose(x=0.0, y=0.0))
+    assert first_cmd.target_cell is not None
+
+    degraded_cmd = planner.command_for_pose(_pose(x=0.0, y=0.0, t_monotonic=0.1, health=HealthState.DEGRADED))
+    assert degraded_cmd.mode in {PlannerMode.HOLD, PlannerMode.TURN, PlannerMode.APPROACH_FRONTIER}
+
+    for i in range(1, 4):
+        cmd = planner.command_for_pose(_pose(x=0.0, y=0.0, t_monotonic=0.1 + i * 0.1))
+        assert cmd.mode == PlannerMode.HOLD
+        assert cmd.reason == "pose_recovering"
+
+    recovered_cmd = planner.command_for_pose(_pose(x=0.0, y=0.0, t_monotonic=0.5))
+    assert recovered_cmd.mode in {PlannerMode.FORWARD, PlannerMode.APPROACH_FRONTIER, PlannerMode.TURN}
+    assert recovered_cmd.reason in {"approach_frontier", "align_frontier", "frontier_reached_reorient"}

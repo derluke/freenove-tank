@@ -63,6 +63,7 @@ _DEGRADED_HANDOFF_MAX_DURATION_S = 0.75
 _DEGRADED_HANDOFF_MAX_DISTANCE_M = 0.20
 _DEGRADED_FORWARD_GEOMETRY_RAD = math.radians(55.0)
 _DEGRADED_TURN_GEOMETRY_RAD = math.radians(100.0)
+_RECOVERY_HEALTHY_FRAMES = 4
 _TURN_BIAS_WINDOW_S = 0.60
 _TURN_BIAS_MIN_RATE_RAD_S = math.radians(8.0)
 _ANCHOR_TARGET_SLACK_M = 0.30
@@ -144,6 +145,7 @@ class RollingFrontierPlanner:
         self._last_command = PlannerCommand(mode=PlannerMode.HOLD, reason="waiting_for_map")
         self._degraded_handoff: _DegradedHandoff | None = None
         self._recent_pose_samples: Deque[tuple[float, float, tuple[float, float]]] = deque()
+        self._healthy_recovery_streak = _RECOVERY_HEALTHY_FRAMES
 
     @property
     def grid(self) -> RollingFrontierGrid:
@@ -168,18 +170,33 @@ class RollingFrontierPlanner:
 
         if pose.xy_m is None:
             self._degraded_handoff = None
+            self._healthy_recovery_streak = 0
             self._last_command = PlannerCommand(mode=PlannerMode.HOLD, reason="translation_unavailable", confidence=0.0)
             return self._last_command
         if pose.health == HealthState.BROKEN:
             self._degraded_handoff = None
+            self._healthy_recovery_streak = 0
             self._last_command = PlannerCommand(mode=PlannerMode.HOLD, reason="pose_broken", confidence=0.0)
             return self._last_command
         if pose.health == HealthState.DEGRADED:
+            self._healthy_recovery_streak = 0
             return self._command_for_degraded_pose(pose)
 
         self._degraded_handoff = None
         if pose.health != HealthState.HEALTHY:
+            self._healthy_recovery_streak = 0
             self._last_command = PlannerCommand(mode=PlannerMode.HOLD, reason=f"pose_{pose.health.value}", confidence=0.0)
+            return self._last_command
+        self._healthy_recovery_streak += 1
+        if self._healthy_recovery_streak < _RECOVERY_HEALTHY_FRAMES:
+            self._record_pose_sample(pose)
+            self._selected_frontier_cell = None
+            self._selected_frontier_age = 0
+            self._last_command = PlannerCommand(
+                mode=PlannerMode.HOLD,
+                reason="pose_recovering",
+                confidence=0.0,
+            )
             return self._last_command
         self._record_pose_sample(pose)
         if self._recent_turn_in_place_motion(pose):

@@ -242,7 +242,7 @@ def test_frontier_replay_straight_drive_produces_frontier_commands(phase0c_dir: 
 
 
 @pytest.mark.slow
-def test_frontier_replay_turn_in_place_emits_meaningful_turn_fraction(phase0c_dir: Path) -> None:
+def test_frontier_replay_turn_in_place_backs_off_frontier_driving(phase0c_dir: Path) -> None:
     recording = phase0c_dir / "turn_in_place_90"
     cache = _cache_for(recording)
     if not cache.exists():
@@ -256,17 +256,18 @@ def test_frontier_replay_turn_in_place_emits_meaningful_turn_fraction(phase0c_di
     summary = replay(obs, progress_every=0)
     total = max(summary.n_frames, 1)
 
-    assert summary.command_counts[PlannerMode.TURN] >= 0.2 * total, (
-        "turn-in-place replay emitted too little TURN behavior — planner may be "
-        "over-committing to frontier approach during a rotation-heavy segment"
+    non_frontier = summary.command_counts[PlannerMode.TURN] + summary.command_counts[PlannerMode.HOLD]
+    assert summary.health_counts[HealthState.DEGRADED] >= 0.2 * total, (
+        "turn-in-place replay barely degraded — pose/health gating may have regressed"
     )
-    assert summary.command_counts[PlannerMode.HOLD] == 0, (
-        "turn-in-place replay unexpectedly held position despite healthy pose"
+    assert non_frontier >= 0.3 * total, (
+        "turn-in-place replay stayed in frontier-driving mode too much — planner "
+        "should back off on a rotation-heavy segment"
     )
 
 
 @pytest.mark.slow
-def test_frontier_replay_round_trip_uses_bounded_degraded_handoff(phase0c_dir: Path) -> None:
+def test_frontier_replay_round_trip_backs_off_when_pose_degrades(phase0c_dir: Path) -> None:
     recording = phase0c_dir / "round_trip_1"
     cache = _cache_for(recording)
     if not cache.exists():
@@ -281,11 +282,9 @@ def test_frontier_replay_round_trip_uses_bounded_degraded_handoff(phase0c_dir: P
     degraded_frames = summary.health_counts.get(HealthState.DEGRADED, 0)
 
     assert degraded_frames > 0, "round-trip replay never entered DEGRADED; regression no longer exercises the handoff path"
-    assert summary.degraded_continue_ticks > 0, (
-        "degraded replay never continued an in-flight command — "
-        "planner regressed to immediate HOLD on every degraded tick"
+    assert summary.command_counts[PlannerMode.HOLD] >= 0.2 * summary.n_frames, (
+        "round-trip replay did not meaningfully back off despite degraded pose"
     )
-    assert summary.degraded_continue_ticks < degraded_frames, (
-        "degraded replay continued for every degraded tick — "
-        "handoff is no longer bounded"
+    assert summary.final_pose.health != HealthState.HEALTHY, (
+        "round-trip replay ended fully healthy; expected a hard segment to remain degraded"
     )

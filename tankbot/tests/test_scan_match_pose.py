@@ -224,3 +224,44 @@ def test_windowed_velocity_gate_rejects_sustained_implausible_motion() -> None:
     assert pose.health != HealthState.HEALTHY
     if pose.xy_m is not None:
         assert pose.xy_m[0] < 0.8
+
+
+def test_high_gyro_rate_freezes_translation_and_degrades() -> None:
+    """With gyro present, sustained high yaw rate must not keep committing xy.
+
+    This is the turn_in_place regression: the rotation gate used to be dead
+    under gyro because it only triggered when gyro_delta was None, which never
+    happens on the normal gyro-guided path.
+    """
+    cfg = ScanMatchConfig(
+        residual_degraded=0.30,
+        rotation_degrade_frames=2,
+        max_rotation_rate_rad_s=0.20,
+        common_bin_max_gyro_delta_rad=0.12,
+        keyframe_yaw_rad=10.0,
+    )
+    ps = ScanMatchPoseSource(
+        scan_config=ScanConfig(),
+        icp_config=ICPConfig(),
+        config=cfg,
+    )
+
+    # Establish a keyframe and a committed forward pose.
+    ps.update(_wall_points(0.0), gyro_yaw=0.0, motors_active=True, t_monotonic=0.0)
+    ps.update(_wall_points(-0.08), gyro_yaw=0.0, motors_active=True, t_monotonic=0.10)
+    pose_before_turn = ps.latest()
+    assert pose_before_turn.xy_m is not None
+    x_before, y_before = pose_before_turn.xy_m
+
+    # Keep feeding scans that would otherwise imply more forward translation,
+    # but with a sustained high gyro rate. Translation should freeze and the
+    # pose should demote once the rate persists.
+    ps.update(_wall_points(-0.16), gyro_yaw=0.05, motors_active=True, t_monotonic=0.20)
+    ps.update(_wall_points(-0.24), gyro_yaw=0.10, motors_active=True, t_monotonic=0.30)
+
+    pose_after_turn = ps.latest()
+    assert pose_after_turn.xy_m is not None
+    x_after, y_after = pose_after_turn.xy_m
+    assert abs(x_after - x_before) < 0.03
+    assert abs(y_after - y_before) < 0.03
+    assert pose_after_turn.health == HealthState.DEGRADED

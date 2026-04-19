@@ -371,7 +371,8 @@ class ScanMatchPoseSource(PoseSource):
         rotating_fast = (
             gyro_yaw is not None
             and abs(gyro_rate_rad_s) > self._cfg.max_rotation_rate_rad_s
-            and gyro_delta is None
+            and gyro_delta is not None
+            and abs(gyro_delta) <= self._cfg.common_bin_max_gyro_delta_rad
         )
 
         if good:
