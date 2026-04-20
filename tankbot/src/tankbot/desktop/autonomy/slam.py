@@ -82,11 +82,17 @@ def _find_mast3r_root() -> Path:
 
 
 def _ensure_on_path() -> Path:
-    """Add MASt3R-SLAM to sys.path."""
+    """Add MASt3R-SLAM and its vendored third-party trees to sys.path."""
     root = _find_mast3r_root()
-    root_str = str(root)
-    if root_str not in sys.path:
-        sys.path.insert(0, root_str)
+    candidates = [
+        root,
+        root / "thirdparty" / "mast3r",
+        root / "thirdparty" / "mast3r" / "dust3r",
+    ]
+    for candidate in candidates:
+        candidate_str = str(candidate)
+        if candidate.exists() and candidate_str not in sys.path:
+            sys.path.insert(0, candidate_str)
     return root
 
 
