@@ -49,6 +49,8 @@ from tankbot.desktop.autonomy.scanmatch_eval import (
     build_observations,
 )
 
+_DERIVED_DATASET_MARKERS = ("raw_concat",)
+
 
 @dataclass(frozen=True)
 class HealthTransition:
@@ -372,13 +374,15 @@ def _print_summary(s: ReplaySummary) -> None:
         print("  health transitions: none")
 
 
-def _discover_datasets(dataset_root: Path) -> list[Path]:
+def _discover_datasets(dataset_root: Path, *, include_derived: bool = False) -> list[Path]:
     if not dataset_root.exists():
         msg = f"Dataset root not found: {dataset_root}"
         raise FileNotFoundError(msg)
     return sorted(
         p for p in dataset_root.iterdir()
-        if p.is_dir() and is_stream_dataset(p)
+        if p.is_dir()
+        and is_stream_dataset(p)
+        and (include_derived or not any(marker in p.name for marker in _DERIVED_DATASET_MARKERS))
     )
 
 
@@ -511,6 +515,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--render-every", type=int, default=10, help="Render every Nth frame.")
     parser.add_argument("--upscale", type=int, default=5, help="Nearest-neighbor upscale factor for panels.")
     parser.add_argument("--save-json", type=Path, default=None, help="If set, write sweep rows to JSON.")
+    parser.add_argument(
+        "--include-derived",
+        action="store_true",
+        help="Include derived/non-primary recordings like *_raw_concat in dataset-root sweeps.",
+    )
     args = parser.parse_args(argv)
 
     grid_cfg = RollingGridConfig(
@@ -521,7 +530,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     if args.dataset_root is not None:
-        datasets = _discover_datasets(args.dataset_root)
+        datasets = _discover_datasets(args.dataset_root, include_derived=args.include_derived)
         rows = sweep_datasets(
             datasets,
             backend=args.backend,

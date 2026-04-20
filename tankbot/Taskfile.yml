@@ -308,6 +308,7 @@ tasks:
         {{if .RENDER_DIR}}--render-dir {{.RENDER_DIR}}{{end}}
         {{if .MAX_FRAMES}}--max-frames {{.MAX_FRAMES}}{{end}}
         {{if .SAVE_JSON}}--save-json {{.SAVE_JSON}}{{end}}
+        {{if .INCLUDE_DERIVED}}--include-derived{{end}}
         {{if .REBUILD}}--rebuild-cache{{end}}
 
   projection:inspect:

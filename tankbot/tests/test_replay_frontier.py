@@ -120,11 +120,26 @@ def test_discover_datasets_returns_sorted_stream_dirs(tmp_path: Path) -> None:
     (root / "b_case" / FRAME_LOG_NAME).write_text("", encoding="utf-8")
     (root / "a_case").mkdir()
     (root / "a_case" / FRAME_LOG_NAME).write_text("", encoding="utf-8")
+    (root / "straight_2m_raw_concat").mkdir()
+    (root / "straight_2m_raw_concat" / FRAME_LOG_NAME).write_text("", encoding="utf-8")
     (root / "ignore_me").mkdir()
 
     discovered = _discover_datasets(root)
 
     assert [p.name for p in discovered] == ["a_case", "b_case"]
+
+
+def test_discover_datasets_can_include_derived_runs(tmp_path: Path) -> None:
+    root = tmp_path / "phase0c"
+    root.mkdir()
+    (root / "a_case").mkdir()
+    (root / "a_case" / FRAME_LOG_NAME).write_text("", encoding="utf-8")
+    (root / "straight_2m_raw_concat").mkdir()
+    (root / "straight_2m_raw_concat" / FRAME_LOG_NAME).write_text("", encoding="utf-8")
+
+    discovered = _discover_datasets(root, include_derived=True)
+
+    assert [p.name for p in discovered] == ["a_case", "straight_2m_raw_concat"]
 
 
 def test_sweep_datasets_aggregates_rows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
