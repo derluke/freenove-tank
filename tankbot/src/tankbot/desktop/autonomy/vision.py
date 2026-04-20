@@ -29,6 +29,12 @@ from pathlib import Path
 
 from tankbot.desktop.autonomy.frontier import FrontierPlanner, PlannerMode
 from tankbot.desktop.autonomy.planning import AutonomyPlanner, Goal, GoalKind
+from tankbot.desktop.autonomy.reactive import ReactiveSafety, SafetyTick, load_extrinsics
+from tankbot.desktop.autonomy.reactive.gyro import GyroIntegrator
+from tankbot.desktop.autonomy.reactive.intrinsics import CameraIntrinsics
+from tankbot.desktop.autonomy.reactive.policy import WanderState
+from tankbot.desktop.autonomy.reactive.pose import GyroPoseSource
+from tankbot.desktop.autonomy.reactive.projection import ProjectionConfig
 from tankbot.desktop.autonomy.robot_client import RobotClient
 from tankbot.desktop.autonomy.slam import SplatSLAM
 
@@ -120,6 +126,8 @@ MIN_STATE_DURATION = {
 
 # SLAM
 PLY_EXPORT_INTERVAL = 5.0  # seconds between PLY exports
+REACTIVE_SAFETY_TURN_DURATION = 0.22
+REACTIVE_SAFETY_REVERSE_DURATION = 0.18
 
 
 class State(StrEnum):
@@ -142,6 +150,71 @@ class FrameContext:
     us_distance: float
     depth_strips: tuple[float, float, float]
     slam_result: object | None
+    reactive_tick: SafetyTick | None
+
+
+@dataclass(frozen=True)
+class SafetyManeuver:
+    left: int
+    right: int
+    duration_s: float
+    remember: bool
+    overridden: bool
+    reason: str | None = None
+
+
+def _reactive_safety_override(
+    left: int,
+    right: int,
+    duration_s: float,
+    tick: SafetyTick | None,
+) -> SafetyManeuver:
+    """Veto unsafe forward motion with the latest reactive safety tick.
+
+    The planner remains authoritative. The reactive layer only gets to
+    intercept forward motion when its stop zone is blocked. Turns,
+    reverse maneuvers, and stop commands pass through unchanged.
+    """
+    base = SafetyManeuver(
+        left=left,
+        right=right,
+        duration_s=duration_s,
+        remember=True,
+        overridden=False,
+        reason=None,
+    )
+    if tick is None or not (left > 0 and right > 0):
+        return base
+    if not tick.stop_zone_blocked:
+        return base
+
+    decision = tick.decision
+    if decision.state == WanderState.TURNING:
+        return SafetyManeuver(
+            left=decision.left_duty,
+            right=decision.right_duty,
+            duration_s=min(duration_s, REACTIVE_SAFETY_TURN_DURATION),
+            remember=False,
+            overridden=True,
+            reason=decision.reason,
+        )
+    if decision.state == WanderState.REVERSING:
+        return SafetyManeuver(
+            left=decision.left_duty,
+            right=decision.right_duty,
+            duration_s=max(duration_s, REACTIVE_SAFETY_REVERSE_DURATION),
+            remember=False,
+            overridden=True,
+            reason=decision.reason,
+        )
+    return SafetyManeuver(
+        left=0,
+        right=0,
+        duration_s=0.0,
+        remember=False,
+        overridden=True,
+        reason=decision.reason,
+    )
 
 
 # Set True to prevent motor commands regardless of --debug flag
@@ -150,7 +223,15 @@ FORCE_DEBUG = False
 
 class VisionEngine:
     def __init__(
-        self, robot_url: str = "", debug: bool = False, splat_dir: str = "", record: bool = False, calib_path: str = ""
+        self,
+        robot_url: str = "",
+        debug: bool = False,
+        splat_dir: str = "",
+        record: bool = False,
+        calib_path: str = "",
+        reactive_extrinsics_path: str = "calibration/camera_extrinsics.yaml",
+        reactive_depth_scale: float = 1.0,
+        reactive_safety: bool = True,
     ) -> None:
         debug = debug or FORCE_DEBUG
         self._record = record
@@ -160,10 +241,18 @@ class VisionEngine:
         robot_url = robot_url or os.environ.get("ROBOT_URL", "ws://localhost:9000")
         self._client = RobotClient(robot_url)
         self._slam = SplatSLAM(calibration_path=calib_path)
+        self._reactive_extrinsics_path = reactive_extrinsics_path
+        self._reactive_depth_scale = reactive_depth_scale
+        self._reactive_safety_requested = reactive_safety
         self._latest_frame: bytes | None = None
         self._latest_telemetry: dict = {}
         self._running = False
         self._debug = debug
+        self._gyro = GyroIntegrator()
+        self._imu_active = False
+        self._reactive_safety: ReactiveSafety | None = None
+        self._last_reactive_tick: SafetyTick | None = None
+        self._last_reactive_override: str | None = None
         self._state = State.SCANNING
         self._phase = ControlPhase.BOOTSTRAP
         self._state_since = time.monotonic()
@@ -252,6 +341,41 @@ class VisionEngine:
     # ------------------------------------------------------------------
     def _load_models(self) -> None:
         self._slam.load()
+        if not self._reactive_safety_requested:
+            log.info("Reactive safety veto disabled by CLI.")
+            return
+        if not getattr(self._slam, "_use_calib", False) or getattr(self._slam, "_intrinsics", None) is None:
+            log.warning(
+                "Reactive safety veto disabled: MASt3R is not in calibrated mode, so live depth is not metric enough"
+            )
+            return
+
+        slam_intrinsics = self._slam._intrinsics.K_frame
+        reactive_intrinsics = CameraIntrinsics(
+            width=int(self._slam._model_w),
+            height=int(self._slam._model_h),
+            fx=float(slam_intrinsics[0, 0]),
+            fy=float(slam_intrinsics[1, 1]),
+            cx=float(slam_intrinsics[0, 2]),
+            cy=float(slam_intrinsics[1, 2]),
+            dist_coeffs=(),
+        )
+        reactive_extrinsics = load_extrinsics(self._reactive_extrinsics_path)
+        self._reactive_safety = ReactiveSafety(
+            intrinsics=reactive_intrinsics,
+            extrinsics=reactive_extrinsics,
+            pose_source=GyroPoseSource(self._gyro),
+            projection_config=ProjectionConfig(
+                depth_scale=self._reactive_depth_scale,
+                undistort_pixels=False,
+            ),
+        )
+        log.info(
+            "Reactive safety veto enabled under MASt3R planner (depth=%dx%d, depth_scale=%.3f)",
+            reactive_intrinsics.width,
+            reactive_intrinsics.height,
+            self._reactive_depth_scale,
+        )
 
     # ------------------------------------------------------------------
     # Callbacks
@@ -261,6 +385,16 @@ class VisionEngine:
 
     async def _on_telemetry(self, data: dict) -> None:
         self._latest_telemetry = data
+
+    async def _on_imu(self, data: dict) -> None:
+        gz = data.get("gz")
+        if gz is None:
+            return
+        sample_t = data.get("t_monotonic")
+        self._gyro.add_sample(float(gz), t=float(sample_t) if isinstance(sample_t, (int, float)) else None)
+        if not self._imu_active:
+            self._imu_active = True
+            log.info("IMU stream active — reactive safety gyro online")
 
     # ------------------------------------------------------------------
     # SLAM analysis
@@ -321,13 +455,30 @@ class VisionEngine:
         await self._motor(0, 0)
 
     async def _run_maneuver(self, left: int, right: int, duration: float, *, remember: bool = True) -> None:
-        self._last_issued_command = (left, right, duration)
-        if remember and (left != 0 or right != 0):
-            self._last_maneuver = (left, right, duration)
-            if left > 0 and right > 0:
-                self._last_forward_maneuver = (left, right, duration)
-        await self._motor(left, right)
-        await asyncio.sleep(duration)
+        maneuver = _reactive_safety_override(left, right, duration, self._last_reactive_tick)
+        self._last_issued_command = (maneuver.left, maneuver.right, maneuver.duration_s)
+        effective_remember = remember and maneuver.remember
+        if effective_remember and (maneuver.left != 0 or maneuver.right != 0):
+            self._last_maneuver = (maneuver.left, maneuver.right, maneuver.duration_s)
+            if maneuver.left > 0 and maneuver.right > 0:
+                self._last_forward_maneuver = (maneuver.left, maneuver.right, maneuver.duration_s)
+        if maneuver.overridden and maneuver.reason != self._last_reactive_override:
+            log.info(
+                "Reactive safety veto: command (%d,%d,%.2fs) -> (%d,%d,%.2fs) [%s]",
+                left,
+                right,
+                duration,
+                maneuver.left,
+                maneuver.right,
+                maneuver.duration_s,
+                maneuver.reason,
+            )
+            self._last_reactive_override = maneuver.reason
+        elif not maneuver.overridden:
+            self._last_reactive_override = None
+        await self._motor(maneuver.left, maneuver.right)
+        if maneuver.duration_s > 0.0:
+            await asyncio.sleep(maneuver.duration_s)
         await self._stop()
 
     async def _run_turn(self, turn_dir: int, speed: int, duration: float, *, remember: bool = True) -> None:
@@ -466,7 +617,11 @@ class VisionEngine:
         return (now - self._startup_ready_since) >= STARTUP_SETTLE_SECONDS
 
     async def _send_vision_status(
-        self, us_distance: float, depth_strips: tuple[float, float, float], slam_result
+        self,
+        us_distance: float,
+        depth_strips: tuple[float, float, float],
+        slam_result,
+        reactive_tick: SafetyTick | None = None,
     ) -> None:
         self._send_counter += 1
         plan = self._planner.snapshot(phase=self._phase.value)
@@ -500,6 +655,7 @@ class VisionEngine:
                     "goal": plan.goal.kind.value,
                     "behavior": plan.behavior.value,
                     "phase": plan.phase,
+                    "reactive_enabled": self._reactive_safety is not None,
                     "planner_mode": self._planner_snapshot.planner_mode,
                     "frontier_count": self._planner_snapshot.frontier_count,
                     "coverage_ratio": round(float(self._planner_snapshot.coverage_ratio), 3),
@@ -520,6 +676,20 @@ class VisionEngine:
                         if self._last_planner_command is not None and self._last_planner_command.target_cell is not None
                         else None
                     ),
+                    "reactive_stop_blocked": bool(reactive_tick.stop_zone_blocked) if reactive_tick is not None else None,
+                    "reactive_stop_cells": int(reactive_tick.stop_zone_count) if reactive_tick is not None else None,
+                    "reactive_near_field_veto": bool(reactive_tick.near_field_veto) if reactive_tick is not None else None,
+                    "reactive_clearance_forward_m": (
+                        round(float(reactive_tick.clearance_forward_m), 3) if reactive_tick is not None else None
+                    ),
+                    "reactive_clearance_left_m": (
+                        round(float(reactive_tick.clearance_left_m), 3) if reactive_tick is not None else None
+                    ),
+                    "reactive_clearance_right_m": (
+                        round(float(reactive_tick.clearance_right_m), 3) if reactive_tick is not None else None
+                    ),
+                    "reactive_reason": reactive_tick.decision.reason if reactive_tick is not None else None,
+                    "reactive_state": reactive_tick.decision.state.value if reactive_tick is not None else None,
                 },
             )
         except Exception:
@@ -714,6 +884,7 @@ class VisionEngine:
             us_distance=us_distance,
             depth_strips=analysis["depth_strips"],
             slam_result=analysis["slam_result"],
+            reactive_tick=self._last_reactive_tick,
         )
 
     async def _handle_bootstrap_phase(self, ctx: FrameContext) -> bool:
@@ -1194,6 +1365,17 @@ class VisionEngine:
             us_distance = self._filter_distance(raw_us)
             if us_distance == float("inf"):
                 us_distance = -1.0
+            slam_result = analysis["slam_result"]
+            if self._reactive_safety is not None:
+                depth_map = slam_result.depth_map if slam_result is not None else None
+                ultrasonic_m = (us_distance / 100.0) if us_distance > 0 else None
+                self._last_reactive_tick = self._reactive_safety.tick(
+                    depth_map,
+                    ultrasonic_m=ultrasonic_m,
+                    t_now=time.monotonic(),
+                )
+            else:
+                self._last_reactive_tick = None
             ctx = self._build_frame_context(analysis, us_distance)
             slam_result = ctx.slam_result
 
@@ -1217,7 +1399,7 @@ class VisionEngine:
                 await loop.run_in_executor(None, self._maybe_export_ply)
 
             await self._update_led_feedback()
-            await self._send_vision_status(us_distance, depth_strips, slam_result)
+            await self._send_vision_status(us_distance, depth_strips, slam_result, ctx.reactive_tick)
 
             if self._phase == ControlPhase.BOOTSTRAP:
                 handled = await self._handle_bootstrap_phase(ctx)
@@ -1246,6 +1428,7 @@ class VisionEngine:
 
         self._client.on_frame(self._on_frame)
         self._client.on_telemetry(self._on_telemetry)
+        self._client.on_imu(self._on_imu)
 
         await self._client.connect()
         if self._debug:
@@ -1294,6 +1477,22 @@ def main() -> None:
         default="",
         help="Path to MASt3R-SLAM intrinsics YAML (or set ROBOT_CAMERA_CALIB env var)",
     )
+    parser.add_argument(
+        "--reactive-extrinsics",
+        default="calibration/camera_extrinsics.yaml",
+        help="Path to reactive-safety camera extrinsics YAML",
+    )
+    parser.add_argument(
+        "--reactive-depth-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied to MASt3R depth before reactive safety projection",
+    )
+    parser.add_argument(
+        "--no-reactive-safety",
+        action="store_true",
+        help="Disable reactive safety veto under the MASt3R planner",
+    )
     args = parser.parse_args()
 
     engine = VisionEngine(
@@ -1302,6 +1501,9 @@ def main() -> None:
         splat_dir=args.splat_dir,
         record=args.record,
         calib_path=args.calib,
+        reactive_extrinsics_path=args.reactive_extrinsics,
+        reactive_depth_scale=args.reactive_depth_scale,
+        reactive_safety=not args.no_reactive_safety,
     )
     asyncio.run(engine.run())
 

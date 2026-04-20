@@ -187,10 +187,18 @@ tasks:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000
 
   vision:legacy:start:calib:
-    desc: Start the old integrated Tankbot vision engine with camera calibration enabled
+    desc: Start the MASt3R planner path with reactive safety veto enabled
     preconditions:
       - sh: test -n "{{.CAMERA_CALIB}}"
         msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:legacy:start:calib CAMERA_CALIB=vendor/MASt3R-SLAM/config/intrinsics.yaml`
+    cmds:
+      - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --calib {{.CAMERA_CALIB}}
+
+  vision:hybrid:start:calib:
+    desc: Start the MASt3R planner path with reactive safety veto enabled
+    preconditions:
+      - sh: test -n "{{.CAMERA_CALIB}}"
+        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:hybrid:start:calib CAMERA_CALIB=calibration/camera_intrinsics.yaml`
     cmds:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --calib {{.CAMERA_CALIB}}
 
@@ -200,10 +208,18 @@ tasks:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug
 
   vision:legacy:debug:calib:
-    desc: Legacy vision debug mode with camera calibration enabled
+    desc: Debug the MASt3R planner path with reactive safety veto enabled
     preconditions:
       - sh: test -n "{{.CAMERA_CALIB}}"
         msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:legacy:debug:calib CAMERA_CALIB=vendor/MASt3R-SLAM/config/intrinsics.yaml`
+    cmds:
+      - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug --calib {{.CAMERA_CALIB}}
+
+  vision:hybrid:debug:calib:
+    desc: Debug the MASt3R planner path with reactive safety veto enabled
+    preconditions:
+      - sh: test -n "{{.CAMERA_CALIB}}"
+        msg: Set CAMERA_CALIB to an intrinsics YAML path, e.g. `task vision:hybrid:debug:calib CAMERA_CALIB=calibration/camera_intrinsics.yaml`
     cmds:
       - uv run tankbot-vision --robot ws://{{.PI_HOST}}:9000 --debug --calib {{.CAMERA_CALIB}}
 
