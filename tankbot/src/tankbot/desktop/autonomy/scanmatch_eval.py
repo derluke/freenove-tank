@@ -70,6 +70,7 @@ class Observations:
     frame_idx: np.ndarray  # (N,) int32
     gyro_yaw: np.ndarray  # (N,) float64 — rad, NaN before IMU start
     motors_active: np.ndarray  # (N,) bool
+    last_motor_active_t: np.ndarray  # (N,) float64 — NaN when unseen
     points_offsets: np.ndarray  # (N+1,) int32 — CSR-style concat offsets
     points_xyz: np.ndarray  # (sum, 3) float32 robot-frame
 
@@ -94,18 +95,69 @@ def _save_observations(path: Path, obs: Observations) -> None:
         frame_idx=obs.frame_idx,
         gyro_yaw=obs.gyro_yaw,
         motors_active=obs.motors_active,
+        last_motor_active_t=obs.last_motor_active_t,
         points_offsets=obs.points_offsets,
         points_xyz=obs.points_xyz,
     )
 
 
+def _derive_motor_activity_sidechannel(dataset: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Frame-aligned motor state plus exact last-nonzero timestamp."""
+    motors_active = False
+    motor_seen = False
+    last_motor_active_t: float | None = None
+    active_rows: list[bool] = []
+    last_active_rows: list[float] = []
+
+    for event in iter_dataset_events(dataset):
+        payload = event.payload
+        if event.channel == "imu" and isinstance(payload, ImuRecord):
+            if payload.motor_left is not None and payload.motor_right is not None:
+                motors_active = payload.motor_left != 0 or payload.motor_right != 0
+                motor_seen = True
+                if motors_active:
+                    last_motor_active_t = payload.t_monotonic
+        elif event.channel == "telemetry" and isinstance(payload, TelemetryRecord):
+            motor = payload.payload.get("motor")
+            if isinstance(motor, dict):
+                left = int(motor.get("left", 0))
+                right = int(motor.get("right", 0))
+                motors_active = left != 0 or right != 0
+                motor_seen = True
+                if motors_active:
+                    last_motor_active_t = payload.t_monotonic
+        elif event.channel == "frame" and isinstance(payload, FrameRecord):
+            active_rows.append(motors_active if motor_seen else True)
+            last_active_rows.append(last_motor_active_t if last_motor_active_t is not None else float("nan"))
+
+    return (
+        np.asarray(active_rows, dtype=bool),
+        np.asarray(last_active_rows, dtype=np.float64),
+    )
+
+
 def _load_observations(path: Path) -> Observations:
     data = np.load(path)
+    if "last_motor_active_t" in data:
+        last_motor_active_t = data["last_motor_active_t"]
+    else:
+        # Older caches only stored the sampled motor state at frame time.
+        # Rehydrate the exact last-nonzero event timestamp from the dataset
+        # logs so replay can honor pulse/coast gaps without re-running depth.
+        _motors_active, last_motor_active_t = _derive_motor_activity_sidechannel(path.parent)
+        if len(_motors_active) == data["t_monotonic"].shape[0]:
+            motors_active = _motors_active
+        else:
+            motors_active = data["motors_active"].astype(bool)
+            last_motor_active_t = np.full(data["t_monotonic"].shape[0], float("nan"), dtype=np.float64)
+    if "last_motor_active_t" in data:
+        motors_active = data["motors_active"].astype(bool)
     return Observations(
         t_monotonic=data["t_monotonic"],
         frame_idx=data["frame_idx"].astype(np.int32),
         gyro_yaw=data["gyro_yaw"],
-        motors_active=data["motors_active"].astype(bool),
+        motors_active=motors_active,
+        last_motor_active_t=np.asarray(last_motor_active_t, dtype=np.float64),
         points_offsets=data["points_offsets"].astype(np.int32),
         points_xyz=data["points_xyz"].astype(np.float32),
     )
@@ -121,6 +173,7 @@ def _slice_observations(obs: Observations, max_frames: int | None) -> Observatio
         frame_idx=obs.frame_idx[:n].copy(),
         gyro_yaw=obs.gyro_yaw[:n].copy(),
         motors_active=obs.motors_active[:n].copy(),
+        last_motor_active_t=obs.last_motor_active_t[:n].copy(),
         points_offsets=obs.points_offsets[: n + 1].copy(),
         points_xyz=obs.points_xyz[:end_offset].copy(),
     )
@@ -164,9 +217,11 @@ def build_observations(
     idxs: list[int] = []
     yaws: list[float] = []
     mots: list[bool] = []
+    motor_active_ts: list[float] = []
     pts_chunks: list[np.ndarray] = []
     offsets: list[int] = [0]
     running = 0
+    last_motor_active_t: float | None = None
 
     frames_done = 0
     try:
@@ -178,6 +233,8 @@ def build_observations(
                 if payload.motor_left is not None and payload.motor_right is not None:
                     motors_active = payload.motor_left != 0 or payload.motor_right != 0
                     motor_seen = True
+                    if motors_active:
+                        last_motor_active_t = payload.t_monotonic
             elif event.channel == "telemetry" and isinstance(payload, TelemetryRecord):
                 motor = payload.payload.get("motor")
                 if isinstance(motor, dict):
@@ -185,6 +242,8 @@ def build_observations(
                     right = int(motor.get("right", 0))
                     motors_active = left != 0 or right != 0
                     motor_seen = True
+                    if motors_active:
+                        last_motor_active_t = payload.t_monotonic
             elif event.channel == "frame" and isinstance(payload, FrameRecord):
                 bgr = cv2.imread(str(payload.path))
                 if bgr is None:
@@ -202,6 +261,7 @@ def build_observations(
                 idxs.append(payload.index)
                 yaws.append(gyro.yaw_rad if imu_seen else float("nan"))
                 mots.append(motors_active if motor_seen else True)
+                motor_active_ts.append(last_motor_active_t if last_motor_active_t is not None else float("nan"))
                 pts_chunks.append(points)
                 running += points.shape[0]
                 offsets.append(running)
@@ -230,6 +290,7 @@ def build_observations(
         frame_idx=np.asarray(idxs, dtype=np.int32),
         gyro_yaw=np.asarray(yaws, dtype=np.float64),
         motors_active=np.asarray(mots, dtype=bool),
+        last_motor_active_t=np.asarray(motor_active_ts, dtype=np.float64),
         points_offsets=np.asarray(offsets, dtype=np.int32),
         points_xyz=points_xyz,
     )
@@ -337,10 +398,13 @@ def evaluate_run(
         points = obs.frame_points(i)
         gyro_yaw = float(obs.gyro_yaw[i])
         gyro_arg = None if math.isnan(gyro_yaw) else gyro_yaw
+        last_motor_active_t = float(obs.last_motor_active_t[i])
+        last_motor_active_arg = None if math.isnan(last_motor_active_t) else last_motor_active_t
         pose_source.update(
             points,
             gyro_yaw=gyro_arg,
             motors_active=bool(obs.motors_active[i]),
+            last_motor_active_t=last_motor_active_arg,
             t_monotonic=float(obs.t_monotonic[i]),
         )
 

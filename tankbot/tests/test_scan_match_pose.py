@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 
 from tankbot.desktop.autonomy.reactive.pose import HealthState
-from tankbot.desktop.autonomy.reactive.scan import ScanConfig
+from tankbot.desktop.autonomy.reactive.scan import Scan2D, ScanConfig
 from tankbot.desktop.autonomy.reactive.scan_match import ICPConfig
 from tankbot.desktop.autonomy.reactive.scan_match_pose import (
     ScanMatchConfig,
@@ -265,3 +265,85 @@ def test_high_gyro_rate_freezes_translation_and_degrades() -> None:
     assert abs(x_after - x_before) < 0.03
     assert abs(y_after - y_before) < 0.03
     assert pose_after_turn.health == HealthState.DEGRADED
+
+
+def test_recent_motor_event_keeps_translation_alive_across_frame_gap() -> None:
+    """Exact last-nonzero motor timing should bridge pulse/coast gaps."""
+    cfg = ScanMatchConfig(
+        pose_ema_alpha=1.0,
+        residual_degraded=0.30,
+        motor_coast_hold_s=0.20,
+    )
+    ps = ScanMatchPoseSource(
+        scan_config=ScanConfig(),
+        icp_config=ICPConfig(),
+        config=cfg,
+    )
+
+    ps.update(_wall_points(0.0), gyro_yaw=0.0, motors_active=False, t_monotonic=0.0)
+    ps.update(
+        _wall_points(-0.10),
+        gyro_yaw=0.0,
+        motors_active=False,
+        last_motor_active_t=0.45,
+        t_monotonic=0.50,
+    )
+
+    pose = ps.latest()
+    assert pose.xy_m is not None
+    assert pose.xy_m[0] > 0.05
+
+
+def test_common_bin_translation_prefers_nearest_front_bins() -> None:
+    """Nearest front-facing bins should dominate the gyro path.
+
+    This guards the straight-run regression where farther side structure
+    could overwhelm the common-bin median and flip a forward estimate
+    backward even when the nearer frontal bins still indicated forward
+    motion.
+    """
+    cfg = ScanMatchConfig(
+        common_bin_max_angle_rad=1.0,
+        common_bin_keep_nearest_n=6,
+    )
+    ps = ScanMatchPoseSource(
+        scan_config=ScanConfig(),
+        icp_config=ICPConfig(),
+        config=cfg,
+    )
+
+    angles = np.linspace(-0.3, 0.3, 20, dtype=np.float32)
+    ref_x = np.concatenate(
+        [
+            np.full(6, 1.2, dtype=np.float32),
+            np.full(14, 3.0, dtype=np.float32),
+        ]
+    )
+    src_x = np.concatenate(
+        [
+            ref_x[:6] - 0.08,
+            ref_x[6:] + 0.40,
+        ]
+    )
+    cos_a = np.cos(angles)
+    ref_ranges = ref_x / cos_a
+    src_ranges = src_x / cos_a
+
+    scan_cfg = ScanConfig(max_range_m=5.0)
+    ps._keyframe_scan = Scan2D(
+        ranges=ref_ranges.astype(np.float32),
+        angles=angles,
+        config=scan_cfg,
+        n_valid_bins=20,
+    )
+
+    current_scan = Scan2D(
+        ranges=src_ranges.astype(np.float32),
+        angles=angles,
+        config=scan_cfg,
+        n_valid_bins=20,
+    )
+
+    result = ps._match_common_bin_translation(current_scan, gyro_delta=0.0)
+
+    assert result.dx > 0.05, f"nearest front bins did not dominate: dx={result.dx:.3f}"

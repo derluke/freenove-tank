@@ -165,10 +165,18 @@ class ScanMatchConfig:
     scan bins instead of full 2D ICP. On wall-dominated scenes this is
     materially more stable for forward motion."""
 
-    common_bin_max_angle_rad: float = math.pi / 3
-    """Use only the central field of view for gyro-guided translation.
-    Edge bins swing hardest under small yaw/scale errors and were a
-    common source of wrong-sign forward estimates."""
+    common_bin_max_angle_rad: float = 0.35
+    """Use only a fairly narrow central field of view for gyro-guided
+    translation. Wider bands help some scenes, but on the Phase 0c set
+    they also pull in side structure that frequently flips the forward
+    estimate sign on long straight runs."""
+
+    common_bin_keep_nearest_n: int = 18
+    """Within the central band, keep only the nearest bin pairs when
+    estimating forward translation. Those bins are the best proxy for
+    actual frontal motion; farther bins are more likely to be side
+    structure whose apparent motion is dominated by monocular depth
+    bias rather than robot translation."""
 
     common_bin_max_gyro_delta_rad: float = 0.12
     """Only use the common-bin translation path while yaw since the
@@ -263,6 +271,7 @@ class ScanMatchPoseSource(PoseSource):
         rotation_prior: float | None = None,
         gyro_yaw: float | None = None,
         motors_active: bool = True,
+        last_motor_active_t: float | None = None,
         t_monotonic: float | None = None,
     ) -> MatchResult | None:
         """Feed a new frame of robot-frame 3D points.
@@ -280,6 +289,10 @@ class ScanMatchPoseSource(PoseSource):
         motors_active
             False when motors are stopped. Pose is frozen to prevent
             scan-match noise from drifting the position at rest.
+        last_motor_active_t
+            Timestamp of the most recent nonzero motor event. When
+            provided, motor_coast_hold_s is measured from the actual
+            event time rather than the sampled frame-time motor state.
         t_monotonic
             Observation timestamp. When provided, the pose source uses
             it as the authoritative "now" for rate computations. Omit
@@ -330,8 +343,16 @@ class ScanMatchPoseSource(PoseSource):
         if rotation_prior is None:
             rotation_prior = gyro_delta
 
+        if last_motor_active_t is not None:
+            self._motion_allowed_until = max(
+                self._motion_allowed_until,
+                last_motor_active_t + self._cfg.motor_coast_hold_s,
+            )
         if motors_active:
-            self._motion_allowed_until = now + self._cfg.motor_coast_hold_s
+            self._motion_allowed_until = max(
+                self._motion_allowed_until,
+                now + self._cfg.motor_coast_hold_s,
+            )
         motion_allowed = motors_active or now <= self._motion_allowed_until
 
         # Match current scan against keyframe.
@@ -640,6 +661,16 @@ class ScanMatchPoseSource(PoseSource):
 
         ref_x = self._keyframe_scan.ranges[valid] * np.cos(self._keyframe_scan.angles[valid])
         src_x = scan.ranges[valid] * np.cos(scan.angles[valid])
+        keep_n = int(self._cfg.common_bin_keep_nearest_n)
+        if 0 < keep_n < n_valid:
+            # Prefer the nearest front-facing structure. Farther bins in
+            # the same angular band are often side walls or open space,
+            # and on monocular depth those were a major source of
+            # wrong-sign forward estimates on long straight drives.
+            nearest_order = np.argsort(np.minimum(ref_x, src_x))
+            keep = nearest_order[:keep_n]
+            ref_x = ref_x[keep]
+            src_x = src_x[keep]
         diffs = ref_x - src_x
         dx = float(np.median(diffs))
         residual = float(np.median(np.abs(diffs - dx)))

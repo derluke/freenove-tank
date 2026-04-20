@@ -238,10 +238,13 @@ def replay(
         points = obs.frame_points(i)
         gyro_yaw = float(obs.gyro_yaw[i])
         gyro_arg = None if math.isnan(gyro_yaw) else gyro_yaw
+        last_motor_active_t = float(obs.last_motor_active_t[i])
+        last_motor_active_arg = None if math.isnan(last_motor_active_t) else last_motor_active_t
         pose_source.update(
             points,
             gyro_yaw=gyro_arg,
             motors_active=bool(obs.motors_active[i]),
+            last_motor_active_t=last_motor_active_arg,
             t_monotonic=float(obs.t_monotonic[i]),
         )
         pose = pose_source.latest()

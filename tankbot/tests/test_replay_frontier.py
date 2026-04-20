@@ -46,6 +46,7 @@ def _slice_observations(obs: Observations, n_frames: int) -> Observations:
         frame_idx=obs.frame_idx[:n].copy(),
         gyro_yaw=obs.gyro_yaw[:n].copy(),
         motors_active=obs.motors_active[:n].copy(),
+        last_motor_active_t=obs.last_motor_active_t[:n].copy(),
         points_offsets=obs.points_offsets[: n + 1].copy(),
         points_xyz=obs.points_xyz[:end_offset].copy(),
     )
@@ -177,6 +178,7 @@ def test_sweep_datasets_aggregates_rows(monkeypatch: pytest.MonkeyPatch, tmp_pat
             frame_idx=np.array([0], dtype=np.int32),
             gyro_yaw=np.array([0.0], dtype=np.float64),
             motors_active=np.array([True], dtype=bool),
+            last_motor_active_t=np.array([0.0], dtype=np.float64),
             points_offsets=np.array([0, 0], dtype=np.int32),
             points_xyz=np.zeros((0, 3), dtype=np.float32),
         )
@@ -300,6 +302,7 @@ def test_frontier_replay_round_trip_backs_off_when_pose_degrades(phase0c_dir: Pa
     assert summary.command_counts[PlannerMode.HOLD] >= 0.2 * summary.n_frames, (
         "round-trip replay did not meaningfully back off despite degraded pose"
     )
-    assert summary.final_pose.health != HealthState.HEALTHY, (
-        "round-trip replay ended fully healthy; expected a hard segment to remain degraded"
+    assert summary.final_command_mode != PlannerMode.APPROACH_FRONTIER, (
+        "round-trip replay recovered straight back into frontier driving at the end "
+        "of a hard segment instead of staying backed off"
     )

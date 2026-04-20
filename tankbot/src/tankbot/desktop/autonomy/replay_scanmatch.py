@@ -175,25 +175,30 @@ def main(argv: list[str] | None = None) -> None:
     motors_active = bool(args.assume_motors_active)
     imu_seen = False
     motor_seen = args.assume_motors_active
+    last_motor_active_t: float | None = None
     frame_count = 0
     n_events = 0
 
     def _on_telemetry(rec: TelemetryRecord) -> None:
-        nonlocal motors_active, motor_seen
+        nonlocal motors_active, motor_seen, last_motor_active_t
         motor = rec.payload.get("motor")
         if isinstance(motor, dict):
             left = int(motor.get("left", 0))
             right = int(motor.get("right", 0))
             motors_active = left != 0 or right != 0
             motor_seen = True
+            if motors_active:
+                last_motor_active_t = rec.t_monotonic
 
     def _on_imu(rec: ImuRecord) -> None:
-        nonlocal motors_active, imu_seen, motor_seen
+        nonlocal motors_active, imu_seen, motor_seen, last_motor_active_t
         gyro.add_sample(rec.gz, t=rec.t_monotonic)
         imu_seen = True
         if rec.motor_left is not None and rec.motor_right is not None:
             motors_active = rec.motor_left != 0 or rec.motor_right != 0
             motor_seen = True
+            if motors_active:
+                last_motor_active_t = rec.t_monotonic
 
     def _on_frame(rec: FrameRecord) -> bool:
         """Run one pipeline step for this frame. Returns False to abort."""
@@ -216,12 +221,14 @@ def main(argv: list[str] | None = None) -> None:
 
         gyro_yaw = None if args.ignore_imu or not imu_seen else gyro.yaw_rad
         effective_motors = motors_active or not motor_seen
+        effective_last_motor_active_t = last_motor_active_t if motor_seen else None
 
         t_match = time.monotonic()
         pose_source.update(
             points,
             gyro_yaw=gyro_yaw,
             motors_active=effective_motors,
+            last_motor_active_t=effective_last_motor_active_t,
             t_monotonic=rec.t_monotonic,
         )
         match_ms = (time.monotonic() - t_match) * 1000.0
